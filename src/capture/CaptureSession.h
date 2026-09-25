@@ -133,10 +133,13 @@ public:
     void Stop();
     void OnItemClosed();
     void PumpHandoff();
+    void NoteGeometryGeneration(std::uint64_t geometryGeneration) noexcept;
 
     CaptureSessionState State() const noexcept;
     FramePacket LastPacket() const;
     bool HasOwnedFrame() const noexcept;
+    // Borrowed; valid on the graphics/UI thread until Stop/OnItemClosed.
+    ID3D11Texture2D* BorrowOwnedTexture() const noexcept;
     std::wstring FormatReport() const;
 
 private:

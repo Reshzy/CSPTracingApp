@@ -20,6 +20,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include <winrt/base.h>
 
 #include "capture/CaptureSession.h"
+#include "graphics/CapturePreview.h"
 #include "graphics/DeviceResources.h"
 #include "graphics/OverlaySurface.h"
 #include "platform/TargetDiscovery.h"
@@ -27,7 +28,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 
 namespace {
 constexpr int kDefaultWidth = 720;
-constexpr int kDefaultHeight = 800;
+constexpr int kDefaultHeight = 840;
 constexpr wchar_t kWindowClass[] = L"TracingAppControlWindow";
 constexpr wchar_t kWindowTitle[] = L"TracingApp";
 constexpr int kIdList = 1001;
@@ -41,6 +42,7 @@ constexpr int kIdAlignmentMode = 1008;
 constexpr int kIdCoverProbe = 1009;
 constexpr int kIdStartCapture = 1010;
 constexpr int kIdStopCapture = 1011;
+constexpr int kIdEnablePreview = 1012;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -59,7 +61,10 @@ struct ControlState
     tracing::platform::GeometrySnapshot lastGeometry;
     tracing::graphics::DeviceResources device;
     tracing::graphics::OverlaySurface overlay;
+    tracing::graphics::CapturePreview preview;
     tracing::capture::CaptureSession capture;
+    HWND previewCheck = nullptr;
+    bool hideOverlayOnCaptureLoss = false;
     std::uint64_t nextGeneration = 1;
 };
 
@@ -70,10 +75,76 @@ std::wstring ControlDpiLine(HWND hwnd)
            L" (physical, PerMonitorV2; not canvas bounds)\r\n";
 }
 
+tracing::graphics::CaptureToClientMapping MappingFromState(ControlState const& state)
+{
+    tracing::capture::FramePacket const packet = state.capture.LastPacket();
+    tracing::platform::PhysicalRect const& client = state.lastGeometry.clientPhysical;
+    tracing::platform::PhysicalRect const& outer = state.lastGeometry.outerWindow;
+    tracing::platform::PhysicalRect const& dwm = state.lastGeometry.dwmFrame;
+    return tracing::graphics::MeasureCaptureToClientMapping(
+        packet.contentWidth,
+        packet.contentHeight,
+        client.x,
+        client.y,
+        client.width,
+        client.height,
+        outer.x,
+        outer.y,
+        outer.width,
+        outer.height,
+        dwm.x,
+        dwm.y,
+        dwm.width,
+        dwm.height);
+}
+
+void SyncPreviewCheckbox(ControlState& state)
+{
+    if (state.previewCheck != nullptr)
+    {
+        SendMessageW(
+            state.previewCheck,
+            BM_SETCHECK,
+            state.preview.IsEnabled() ? BST_CHECKED : BST_UNCHECKED,
+            0);
+    }
+}
+
+void PresentPreview(ControlState& state)
+{
+    SyncPreviewCheckbox(state);
+    if (!state.preview.IsEnabled())
+    {
+        return;
+    }
+
+    tracing::capture::FramePacket const packet = state.capture.LastPacket();
+    bool const itemClosed =
+        state.capture.State() == tracing::capture::CaptureSessionState::ItemClosed;
+    tracing::graphics::CapturePreviewLabel const label = tracing::graphics::ClassifyCapturePreviewLabel(
+        state.capture.HasOwnedFrame(),
+        packet.stale,
+        packet.contentWidth,
+        packet.contentHeight,
+        itemClosed);
+    std::wstring error;
+    state.preview.Present(
+        state.capture.BorrowOwnedTexture(),
+        label,
+        packet.sequence,
+        packet.captureTicks,
+        MappingFromState(state),
+        error);
+}
+
 std::wstring StatusHeader(ControlState const& state)
 {
     return ControlDpiLine(state.control) + state.device.FormatReport() + L"\r\n" +
-           state.overlay.FormatReport() + L"\r\n" + state.capture.FormatReport() + L"\r\n";
+           state.overlay.FormatReport() + L"\r\n" + state.capture.FormatReport() + L"\r\n" +
+           state.preview.FormatReport() + L"\r\n" +
+           tracing::graphics::FormatCaptureToClientMapping(MappingFromState(state)) + L"\r\n" +
+           L"overlayHiddenOnCaptureLoss=" +
+           std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") + L"\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -87,6 +158,22 @@ void SetStatus(ControlState& state, std::wstring const& text)
 void StopCapture(ControlState& state)
 {
     state.capture.Stop();
+    if (state.preview.IsEnabled())
+    {
+        std::wstring error;
+        tracing::graphics::CaptureToClientMapping const mapping = MappingFromState(state);
+        state.preview.Present(
+            nullptr,
+            tracing::graphics::CapturePreviewLabel::NoFrame,
+            0,
+            0,
+            mapping,
+            error);
+    }
+    else
+    {
+        state.preview.Hide();
+    }
 }
 
 void StopWatching(ControlState& state)
@@ -120,6 +207,10 @@ void SyncOverlayFromState(ControlState& state)
         placement.y = geometry.clientPhysical.y;
         placement.width = geometry.clientPhysical.width;
         placement.height = geometry.clientPhysical.height;
+        if (state.hideOverlayOnCaptureLoss)
+        {
+            targetUsable = false;
+        }
     }
     else if (state.overlay.TestPatternActive())
     {
@@ -138,6 +229,7 @@ void SyncOverlayFromState(ControlState& state)
 
 void SetStatusWithOverlay(ControlState& state, std::wstring const& body)
 {
+    SyncPreviewCheckbox(state);
     SyncOverlayFromState(state);
     if (body.empty())
     {
@@ -188,6 +280,7 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
     sampled.geometryGeneration =
         tracing::platform::NextGeometryGeneration(state.lastGeometry, sampled);
     state.lastGeometry = sampled;
+    state.capture.NoteGeometryGeneration(sampled.geometryGeneration);
     std::wstring body = tracing::platform::FormatGeometryReport(sampled);
     if (!extra.empty())
     {
@@ -373,6 +466,7 @@ void OnEmergencyHide(ControlState& state)
 
 void OnShowTestMarker(ControlState& state)
 {
+    state.hideOverlayOnCaptureLoss = false;
     state.overlay.ClearEmergencyHide();
     if (!state.selected.has_value())
     {
@@ -420,6 +514,23 @@ void OnStopCapture(ControlState& state)
     }
 }
 
+void OnEnablePreview(ControlState& state)
+{
+    bool const checked =
+        state.previewCheck != nullptr &&
+        SendMessageW(state.previewCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.preview.SetEnabled(checked);
+    if (checked)
+    {
+        PresentPreview(state);
+        SetStatusWithOverlay(
+            state,
+            L"Capture preview enabled (ordinary WDA_NONE debug window; not for recording).");
+        return;
+    }
+    SetStatusWithOverlay(state, L"Capture preview disabled (recording-safe default).");
+}
+
 void StartCaptureNow(ControlState& state)
 {
     if (!state.selected.has_value())
@@ -455,9 +566,10 @@ void StartCaptureNow(ControlState& state)
         SetStatusWithOverlay(state, error);
         return;
     }
+    state.hideOverlayOnCaptureLoss = false;
     RefreshGeometryDisplay(
         state,
-        L"WGC capture started (frame counters/metadata only; not a preview). Overlay test-pattern "
+        L"WGC capture started (owned frames; preview off by default). Overlay test-pattern "
         L"is not a captured frame.");
 }
 
@@ -564,9 +676,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            288,
+            316,
             680,
-            430,
+            440,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -688,6 +800,20 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStopCapture)),
             instance,
             nullptr);
+        created->previewCheck = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Enable capture preview",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            12,
+            284,
+            220,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdEnablePreview)),
+            instance,
+            nullptr);
+        SendMessageW(created->previewCheck, BM_SETCHECK, BST_UNCHECKED, 0);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -701,6 +827,15 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             {
                 OutputDebugStringW(overlayError.c_str());
                 OutputDebugStringW(L"\r\n");
+            }
+            else
+            {
+                std::wstring previewError;
+                if (!created->preview.Create(hwnd, created->device, previewError))
+                {
+                    OutputDebugStringW(previewError.c_str());
+                    OutputDebugStringW(L"\r\n");
+                }
             }
         }
         RefreshCandidates(*created);
@@ -756,6 +891,11 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 OnStopCapture(*state);
                 return 0;
             }
+            if (id == kIdEnablePreview && code == BN_CLICKED)
+            {
+                OnEnablePreview(*state);
+                return 0;
+            }
             if (id == kIdList && code == LBN_DBLCLK)
             {
                 SelectFromUi(*state);
@@ -776,10 +916,18 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (wParam == 1)
             {
                 state->capture.OnItemClosed();
-                RefreshGeometryDisplay(*state, L"WGC item Closed; session torn down.");
+                state->hideOverlayOnCaptureLoss = true;
+                PresentPreview(*state);
+                RefreshGeometryDisplay(*state, L"WGC item Closed; session torn down; tracing overlay hidden.");
                 return 0;
             }
             state->capture.PumpHandoff();
+            tracing::capture::FramePacket const packet = state->capture.LastPacket();
+            if (packet.stale)
+            {
+                state->hideOverlayOnCaptureLoss = true;
+            }
+            PresentPreview(*state);
             RefreshGeometryDisplay(*state, L"");
             return 0;
         }
@@ -817,6 +965,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         {
             StopCapture(*state);
             StopWatching(*state);
+            state->preview.Release();
             state->overlay.Release();
             state->device.Release();
             delete state;

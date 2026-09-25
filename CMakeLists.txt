@@ -27,6 +27,7 @@ add_executable(TracingApp WIN32
     src/platform/TargetGeometry.cpp
     src/graphics/DeviceResources.cpp
     src/graphics/OverlaySurface.cpp
+    src/graphics/CapturePreview.cpp
     src/capture/CaptureSession.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)

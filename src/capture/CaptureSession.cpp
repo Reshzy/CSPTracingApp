@@ -9,6 +9,7 @@
 #include <windows.graphics.directx.direct3d11.interop.h>
 
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.h>
 #include <winrt/Windows.Graphics.Capture.h>
 #include <winrt/Windows.Graphics.DirectX.h>
 #include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
@@ -116,6 +117,10 @@ struct CaptureSession::Impl
     UINT ownedWidth = 0;
     UINT ownedHeight = 0;
     DXGI_FORMAT ownedFormat = DXGI_FORMAT_UNKNOWN;
+    int poolWidth = 0;
+    int poolHeight = 0;
+    std::uint64_t recreateCount = 0;
+    HRESULT lastRecreateHr = S_OK;
 
     void OnFrameArrived(wgc::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&);
     void OnClosed(wgc::GraphicsCaptureItem const&, winrt::Windows::Foundation::IInspectable const&);
@@ -123,6 +128,7 @@ struct CaptureSession::Impl
     void CloseSessionAndPool() noexcept;
     void TeardownResources() noexcept;
     bool CopyOwned(PendingItem& pendingItem, HRESULT& copyHr, std::wstring& error);
+    bool RecreatePoolIfContentSizeChanged(int contentWidth, int contentHeight, HRESULT& recreateHr, std::wstring& error);
 };
 
 CaptureSession::CaptureSession() : impl_(std::make_unique<Impl>()) {}
@@ -217,6 +223,8 @@ void CaptureSession::Impl::TeardownResources() noexcept
     ownedWidth = 0;
     ownedHeight = 0;
     ownedFormat = DXGI_FORMAT_UNKNOWN;
+    poolWidth = 0;
+    poolHeight = 0;
 }
 
 void CaptureSession::Impl::OnClosed(
@@ -373,36 +381,126 @@ bool CaptureSession::Impl::CopyOwned(PendingItem& pendingItem, HRESULT& copyHr, 
         return false;
     }
 
-    D3D11_TEXTURE2D_DESC desc{};
-    source->GetDesc(&desc);
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    desc.CPUAccessFlags = 0;
-    desc.MiscFlags = 0;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.SampleDesc.Count = 1;
-    desc.SampleDesc.Quality = 0;
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    source->GetDesc(&sourceDesc);
 
-    if (!ownedTexture || ownedWidth != desc.Width || ownedHeight != desc.Height ||
-        ownedFormat != desc.Format)
+    UINT copyWidth = sourceDesc.Width;
+    UINT copyHeight = sourceDesc.Height;
+    if (pendingItem.packet.contentWidth > 0 && pendingItem.packet.contentHeight > 0)
+    {
+        copyWidth = static_cast<UINT>(pendingItem.packet.contentWidth);
+        copyHeight = static_cast<UINT>(pendingItem.packet.contentHeight);
+        if (copyWidth > sourceDesc.Width)
+        {
+            copyWidth = sourceDesc.Width;
+        }
+        if (copyHeight > sourceDesc.Height)
+        {
+            copyHeight = sourceDesc.Height;
+        }
+    }
+    if (copyWidth == 0 || copyHeight == 0)
+    {
+        CloseFrameQuiet(pendingItem.frame);
+        error = L"Cannot copy WGC frame: content size is zero.";
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC ownedDesc{};
+    ownedDesc.Width = copyWidth;
+    ownedDesc.Height = copyHeight;
+    ownedDesc.MipLevels = 1;
+    ownedDesc.ArraySize = 1;
+    ownedDesc.Format = sourceDesc.Format;
+    ownedDesc.SampleDesc.Count = 1;
+    ownedDesc.SampleDesc.Quality = 0;
+    ownedDesc.Usage = D3D11_USAGE_DEFAULT;
+    ownedDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    ownedDesc.CPUAccessFlags = 0;
+    ownedDesc.MiscFlags = 0;
+
+    if (!ownedTexture || ownedWidth != copyWidth || ownedHeight != copyHeight ||
+        ownedFormat != sourceDesc.Format)
     {
         ownedTexture.Reset();
-        copyHr = gpu->Device()->CreateTexture2D(&desc, nullptr, &ownedTexture);
+        copyHr = gpu->Device()->CreateTexture2D(&ownedDesc, nullptr, &ownedTexture);
         if (FAILED(copyHr) || !ownedTexture)
         {
             CloseFrameQuiet(pendingItem.frame);
             error = L"CreateTexture2D owned capture copy failed HRESULT=" + FormatHresult(copyHr);
             return false;
         }
-        ownedWidth = desc.Width;
-        ownedHeight = desc.Height;
-        ownedFormat = desc.Format;
+        ownedWidth = copyWidth;
+        ownedHeight = copyHeight;
+        ownedFormat = sourceDesc.Format;
     }
 
-    gpu->ImmediateContext()->CopyResource(ownedTexture.Get(), source.Get());
+    D3D11_BOX box{};
+    box.left = 0;
+    box.top = 0;
+    box.front = 0;
+    box.right = copyWidth;
+    box.bottom = copyHeight;
+    box.back = 1;
+    gpu->ImmediateContext()->CopySubresourceRegion(
+        ownedTexture.Get(),
+        0,
+        0,
+        0,
+        0,
+        source.Get(),
+        0,
+        &box);
     CloseFrameQuiet(pendingItem.frame);
     return true;
+}
+
+bool CaptureSession::Impl::RecreatePoolIfContentSizeChanged(
+    int contentWidth,
+    int contentHeight,
+    HRESULT& recreateHr,
+    std::wstring& error)
+{
+    error.clear();
+    recreateHr = S_OK;
+    if (contentWidth <= 0 || contentHeight <= 0)
+    {
+        return true;
+    }
+    if (!framePool || !winrtDevice)
+    {
+        return true;
+    }
+    if (contentWidth == poolWidth && contentHeight == poolHeight)
+    {
+        return true;
+    }
+
+    winrt::Windows::Graphics::SizeInt32 const newSize{contentWidth, contentHeight};
+    try
+    {
+        framePool.Recreate(
+            winrtDevice,
+            wgd::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            newSize);
+        poolWidth = contentWidth;
+        poolHeight = contentHeight;
+        ++recreateCount;
+        return true;
+    }
+    catch (winrt::hresult_error const& hrError)
+    {
+        recreateHr = hrError.code();
+        error = L"Frame pool Recreate failed HRESULT=" + FormatHresult(recreateHr);
+        return false;
+    }
+    catch (...)
+    {
+        recreateHr = E_FAIL;
+        error = L"Frame pool Recreate failed with an unknown exception.";
+        return false;
+    }
 }
 
 bool CaptureSession::Start(
@@ -486,6 +584,10 @@ bool CaptureSession::Start(
             wgd::DirectXPixelFormat::B8G8R8A8UIntNormalized,
             2,
             contentSize);
+        impl_->poolWidth = contentSize.Width;
+        impl_->poolHeight = contentSize.Height;
+        impl_->recreateCount = 0;
+        impl_->lastRecreateHr = S_OK;
         impl_->session = impl_->framePool.CreateCaptureSession(impl_->item);
         try
         {
@@ -606,9 +708,19 @@ void CaptureSession::PumpHandoff()
     HRESULT copyHr = S_OK;
     std::wstring copyError;
     bool const copied = impl_->CopyOwned(latest, copyHr, copyError);
+
+    HRESULT recreateHr = S_OK;
+    std::wstring recreateError;
+    bool const recreated = impl_->RecreatePoolIfContentSizeChanged(
+        latest.packet.contentWidth,
+        latest.packet.contentHeight,
+        recreateHr,
+        recreateError);
+
     {
         std::lock_guard<std::mutex> const lock(impl_->mutex);
-        impl_->lastHr = copyHr;
+        impl_->lastHr = copied ? recreateHr : copyHr;
+        impl_->lastRecreateHr = recreateHr;
         if (copied)
         {
             impl_->lastPacket = latest.packet;
@@ -620,6 +732,9 @@ void CaptureSession::PumpHandoff()
             impl_->hasOwnedFrame = false;
         }
     }
+    (void)recreated;
+    (void)copyError;
+    (void)recreateError;
 }
 
 CaptureSessionState CaptureSession::State() const noexcept
@@ -652,6 +767,26 @@ bool CaptureSession::HasOwnedFrame() const noexcept
     return impl_->hasOwnedFrame;
 }
 
+void CaptureSession::NoteGeometryGeneration(std::uint64_t geometryGeneration) noexcept
+{
+    if (!impl_)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    impl_->geometryGeneration = geometryGeneration;
+}
+
+ID3D11Texture2D* CaptureSession::BorrowOwnedTexture() const noexcept
+{
+    if (!impl_)
+    {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->ownedTexture.Get();
+}
+
 std::wstring CaptureSession::FormatReport() const
 {
     if (!impl_)
@@ -668,6 +803,10 @@ std::wstring CaptureSession::FormatReport() const
     bool hasOwned = false;
     std::uint64_t targetGeneration = 0;
     std::uint64_t geometryGeneration = 0;
+    int poolWidth = 0;
+    int poolHeight = 0;
+    std::uint64_t recreateCount = 0;
+    HRESULT lastRecreateHr = S_OK;
     {
         std::lock_guard<std::mutex> const lock(impl_->mutex);
         policySnapshot = impl_->policy;
@@ -679,6 +818,10 @@ std::wstring CaptureSession::FormatReport() const
         hasOwned = impl_->hasOwnedFrame;
         targetGeneration = impl_->targetGeneration;
         geometryGeneration = impl_->geometryGeneration;
+        poolWidth = impl_->poolWidth;
+        poolHeight = impl_->poolHeight;
+        recreateCount = impl_->recreateCount;
+        lastRecreateHr = impl_->lastRecreateHr;
     }
 
     std::wstring supportText = L"unchecked";
@@ -699,9 +842,12 @@ std::wstring CaptureSession::FormatReport() const
            std::to_wstring(packet.sequence) + L" contentSize=" +
            std::to_wstring(packet.contentWidth) + L"x" + std::to_wstring(packet.contentHeight) +
            L" captureTicks=" + std::to_wstring(packet.captureTicks) + L" stale=" +
-           (packet.stale ? L"yes" : L"no") + L"\r\n" + L"itemClosed=" + (itemClosed ? L"yes" : L"no") +
+           (packet.stale ? L"yes" : L"no") + L"\r\n" +            L"itemClosed=" + (itemClosed ? L"yes" : L"no") +
            L" ownedFrame=" + (hasOwned ? L"yes" : L"no") + L" lastHr=" + FormatHresult(lastHr) +
-           L" (WGC copies only; overlay test-pattern is not a captured frame)";
+           L"\r\n" + L"poolSize=" + std::to_wstring(poolWidth) + L"x" + std::to_wstring(poolHeight) +
+           L" recreates=" + std::to_wstring(recreateCount) + L" recreateHr=" +
+           FormatHresult(lastRecreateHr) +
+           L" (WGC copies owned textures; overlay test-pattern is not a captured frame)";
 }
 
 } // namespace tracing::capture

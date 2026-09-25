@@ -1,12 +1,12 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Prompt 07-fallback replaced that path with an isolated WS_EX_LAYERED UpdateLayeredWindow presenter; InputProbe click/wheel pass-through now PASSes on both monitors, and tracing hits the titled CSP HWND without overlay activation. Prompt 08 added a C++/WinRT WGC session with a free-threaded frame pool, owned-frame handoff, and control-window counters/metadata. Pen/pressure remains NOT RUN. Capture preview remains Prompt 09. OBS recording remains Prompt 13.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Prompt 07-fallback replaced that path with an isolated WS_EX_LAYERED UpdateLayeredWindow presenter; InputProbe click/wheel pass-through now PASSes on both monitors, and tracing hits the titled CSP HWND without overlay activation. Prompt 08 added a C++/WinRT WGC session with a free-threaded frame pool, owned-frame handoff, and control-window counters/metadata. Prompt 09 added an opt-in ordinary WDA_NONE capture preview, frame-pool Recreate on content-size change, measured capture-to-client mapping, and overlay hide on capture loss. Pen/pressure remains NOT RUN. OBS recording remains Prompt 13.
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: HEAD `3197494` (`feature/init`, Prompt 08 files uncommitted); Win32 control window plus isolated WS_EX_LAYERED overlay HWND (D3D11 test-pattern texture, staging readback, UpdateLayeredWindow; no DirectComposition, no imported-image renderer); WGC session copies owned D3D textures and shows counters/metadata only (no capture preview); Debug `out/build/windows-debug/Debug/TracingApp.exe` (1983488 bytes, 2026-09-25 18:35:56) and `TracingApp.InputProbe.exe` (70144 bytes, 2026-09-25 18:02:00); Release not rebuilt this step
+- App commit/build and renderer path: HEAD `9edfc8a` (`feature/init`, Prompt 09 files uncommitted); Win32 control window plus isolated WS_EX_LAYERED overlay HWND (D3D11 test-pattern texture, staging readback, UpdateLayeredWindow; no DirectComposition, no imported-image renderer); WGC session copies owned D3D textures, Recreates the free-threaded pool on content-size change, and can show an ordinary WDA_NONE debug preview (off by default); Debug `out/build/windows-debug/Debug/TracingApp.exe` (2033664 bytes, 2026-09-25 18:55:23) and `TracingApp.InputProbe.exe` (70144 bytes, 2026-09-25 18:02:00); Release not rebuilt this step
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). SDR/HDR NOT RECORDED
 - Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
 - OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
@@ -20,7 +20,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 - M0 reproducible shell/build/tests: PASS (Prompts 01–02 plus Prompt 04 DPI manifest: local Git, Win32 control window, PerMonitorV2 RT_MANIFEST, vcpkg baseline, first-party `/W4` `/permissive-`, GoogleTest, Debug configure/build/test)
 - M1 CSP discovery/geometry/lifecycle: NOT RUN (Prompt 03 automated tests PASS; Prompt 06 enumerated live CLIPStudioPaint.exe and selected one PAINT row; mixed-DPI move, minimize/restore/close, and titled main-window vs panel disambiguation remain incomplete)
 - M2 transparency/input/affinity: PASS for layered mouse/wheel pass-through (Prompt 07-fallback). Prompt 05 device PASS; Prompt 06 affinity/emergency hide/visibility policy PASS; Prompt 07 DComp path FAIL (superseded). Layered `WS_EX_LAYERED` + tracing `WS_EX_TRANSPARENT` delivers InputProbe click/wheel on both monitors without overlay activation; titled CSP HWND hit-test also skips the overlay. Pen/pressure NOT RUN. OBS Display Capture remains Prompt 13.
-- M3 actual CSP capture/resize/no-feedback: PARTIAL — Prompt 08 WGC counters/content-size PASS on titled CLIP STUDIO PAINT HWND; preview, pool recreate, and overlay-absent-from-capture-texture remain Prompt 09
+- M3 actual CSP capture/resize/no-feedback: PASS for titled CLIP STUDIO PAINT WGC preview + pool Recreate + marker-absent-from-capture-texture (Prompt 09). Prompt 08 counters/content-size remain PASS. Item-closed (CSP close while capturing) NOT RUN. OBS Display Capture remains Prompt 13.
 - M4 imported image/ordinary reference/OBS playback: NOT RUN — mandatory before tracking
 - M5 manual transforms/calibration: NOT RUN
 - M6 visual/parity tracking and confidence safety: NOT RUN
@@ -668,6 +668,72 @@ Manual checklist remaining:
   2. Close CSP while capturing and confirm item-closed.
   3. Prompt 13: saved OBS Display Capture playback.
 Blocker or next prompt: 09 — Capture preview, resize and stale-frame handling
+```
+
+```text
+Step / milestone: 09 / M3 capture preview, resize, stale-frame handling
+Date / commit: 2026-09-25 / working tree on feature/init ahead of 9edfc8a (uncommitted)
+Status: PASS for Debug configure/build/test, opt-in ordinary WDA_NONE preview of actual WGC frames (off by default), pool Recreate on CSP resize, measured capture-to-client mapping, overlay hide on minimize, and magenta marker absent from owned CSP frames. Item-closed by closing CSP NOT RUN. Zero-size stale label not observed (minimize kept last content size).
+Changed files:
+  src/capture/CaptureSession.h
+  src/capture/CaptureSession.cpp
+  src/graphics/CapturePreview.h (new)
+  src/graphics/CapturePreview.cpp (new)
+  src/app/main.cpp
+  CMakeLists.txt
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  cmake --preset windows-debug
+  exit 0
+  reused gtest:x64-windows@1.17.0#3; SDK 10.0.26100.0; CXX MSVC 19.51.36260.0; binaryDir out/build/windows-debug
+Build command + exit code:
+  cmake --build --preset windows-debug
+  exit 0
+  MSBuild 18.10.1-1.26427.6+3cd27c13e
+  TracingApp.exe 2033664 bytes (2026-09-25 18:55:23)
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 6, passed 6, failed 0
+    TracingApp.BootstrapTests
+    TracingApp.TargetSelectionTests
+    TracingApp.GraphicsPolicyTests
+    TracingApp.OverlayPolicyTests
+    TracingApp.CaptureStateTests
+    TracingApp.InputProbe (--self-test of probe counters only)
+Manual setup and exact actions:
+  CLIPStudioPaint.exe 5.0.0 pid 36888; titled HWND 0x70E9A on DISPLAY1. Start TracingApp.exe PID 42732. Refresh, select list row [PAINT] CLIPStudioPaint.exe | CLIP STUDIO PAINT, Start Capture, then Enable capture preview, Show test marker, resize/restore CSP, minimize/restore CSP. Close TracingApp via WM_CLOSE (exit 0). Did not close CSP.
+Expected / actual:
+  expected: preview HWND hidden until checkbox; actual WGC frames (not test-pattern); content-size Recreate; capture vs client mapping measured not hardcoded; STALE/ZERO labels; hide overlay on capture loss; magenta L not in CSP texture
+  actual:
+    after Start Capture, preview enabled=no visible=no checkbox=0; WGC Running accepted=5 contentSize=2576x1456 ownedFrame=yes recreates=0
+    after Enable capture preview: preview enabled=yes visible=yes label=ACTUAL seq=8 bitmap=2576x1456 markerFeedback=no
+    after Show test marker: overlay shown-on-target over CSP; markerFeedback still no (magenta overlay not in owned WGC copy)
+    mapping on this maximized HWND: match=outer-and-dwm content=outer=dwm=client=2576x1456 usingOffset=(0,0) residual=0x0 (not canvas bounds). Prompt 08 had client 2560x1439 vs WGC 2576x1456 on a restored chrome window; this session's QueryPhysicalGeometry client equals DWM/outer.
+    resize 2576x1456 -> 2376x1256: accepted 8->14 contentSize=2376x1256 poolSize=2376x1256 recreates=1 recreateHr=0; preview bitmap followed
+    restore 2576x1456: accepted=18 recreates=2 geomGen=3
+    minimize: overlay visibility=Hide reason=target-unusable; WGC kept last contentSize 2576x1456 (no STALE/ZERO event); eligibility=minimized
+    restore: overlay shown-on-target; accepted=23 recreates=4 geomGen=5
+    overlayHiddenOnCaptureLoss stayed no (minimize is geometry hide, not WGC item-closed/stale)
+    second launch: accepted 1->2 after canvas interaction; preview ACTUAL seq=2 markerFeedback=no; WM_CLOSE exit 0
+Evidence paths (local, no private artwork committed):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/manual/prompt09-preview.txt
+Measured samples / p50 / p95 / max where applicable: n/a (sequence/content-size/recreate count)
+Known limitations / unavailable hardware:
+  cmake/ctest not on PATH; invoked via VS 2026 bundled binaries
+  Release configure/build/test NOT RUN this step
+  CSP close-while-capturing / item-closed NOT RUN (live document not closed)
+  zero-size stale label NOT observed; minimize did not produce a 0x0 WGC content size
+  mixed-DPI still both 96; no negative-origin monitor (maximized CSP client origin Y=-8 is DWM overlap, not a negative monitor origin)
+  preview is a debug WDA_NONE window; must stay off for OBS recording (Prompt 13)
+  markerFeedback=no is WGC-of-CSP proof only, not OBS Display Capture proof
+Manual checklist remaining:
+  1. Close CSP while capturing and confirm item-closed plus overlay hide latch.
+  2. Prompt 10: WIC image import.
+  3. Prompt 13: saved OBS Display Capture playback.
+Blocker or next prompt: 10 — WIC image import
 ```
 
 ## Final acceptance
