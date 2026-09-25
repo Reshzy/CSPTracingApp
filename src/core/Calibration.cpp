@@ -411,7 +411,7 @@ std::string FormatCalibrationReport(CalibrationReport const& report)
     text += report.axisAlignedPlacement ? "yes" : "no";
     if (!report.axisAlignedPlacement)
     {
-        text += " (rotation/flip numerical until ImageRenderer affine substep)";
+        text += " (rotation/flip drawn via overlay-local affine; HWND+RS scissor)";
     }
     return text;
 }

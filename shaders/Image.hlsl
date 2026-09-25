@@ -1,12 +1,15 @@
-// Premultiplied BGRA textured quad. Placement/opacity live in the constant
-// buffer; the source texture is not modified.
+// Premultiplied BGRA textured quad. Overlay-local 2x3 affine and opacity live
+// in the constant buffer; the source texture is not modified.
+// pO = [[m00, m01, tx], [m10, m11, ty]] * [xR, yR, 1]; X-right, Y-down.
 cbuffer Placement : register(b0)
 {
     float2 overlaySize;
-    float2 translation;
     float2 imageSize;
-    float scale;
+    float2 row0;
+    float2 row1;
+    float2 translation;
     float opacity;
+    float _pad;
 };
 
 struct VSOut
@@ -18,7 +21,10 @@ struct VSOut
 VSOut VSMain(uint id : SV_VertexID)
 {
     float2 uv = float2(id & 1, id >> 1);
-    float2 pixel = translation + uv * imageSize * scale;
+    float2 pR = uv * imageSize;
+    float2 pixel = float2(
+        row0.x * pR.x + row0.y * pR.y + translation.x,
+        row1.x * pR.x + row1.y * pR.y + translation.y);
     float2 ndc = float2(-1.0, 1.0);
     if (overlaySize.x > 0.0 && overlaySize.y > 0.0)
     {

@@ -21,15 +21,19 @@ struct PlacementConstants
 {
     float overlayWidth = 0.0f;
     float overlayHeight = 0.0f;
-    float translationX = 0.0f;
-    float translationY = 0.0f;
     float imageWidth = 0.0f;
     float imageHeight = 0.0f;
-    float scale = 1.0f;
+    float m00 = 1.0f;
+    float m01 = 0.0f;
+    float m10 = 0.0f;
+    float m11 = 1.0f;
+    float translationX = 0.0f;
+    float translationY = 0.0f;
     float opacity = 1.0f;
+    float pad = 0.0f;
 };
 
-static_assert(sizeof(PlacementConstants) == 32, "PlacementConstants must match Image.hlsl cbuffer");
+static_assert(sizeof(PlacementConstants) == 48, "PlacementConstants must match Image.hlsl cbuffer");
 
 std::wstring FormatHresult(HRESULT value)
 {
@@ -335,6 +339,12 @@ bool ImageRenderer::DrawToRtv(
     viewport.MinDepth = 0.0f;
     viewport.MaxDepth = 1.0f;
     context->RSSetViewports(1, &viewport);
+    D3D11_RECT scissor{};
+    scissor.left = 0;
+    scissor.top = 0;
+    scissor.right = static_cast<LONG>(width);
+    scissor.bottom = static_cast<LONG>(height);
+    context->RSSetScissorRects(1, &scissor);
     context->RSSetState(rasterizer_.Get());
 
     float blendFactor[4] = {0.0f, 0.0f, 0.0f, 0.0f};
@@ -352,19 +362,34 @@ bool ImageRenderer::DrawToRtv(
     }
 
     ImagePlacement used = placement;
-    if (used.scale <= 0.0)
-    {
-        used.scale = 1.0;
-    }
-
     PlacementConstants constants{};
     constants.overlayWidth = static_cast<float>(width);
     constants.overlayHeight = static_cast<float>(height);
-    constants.translationX = static_cast<float>(used.offsetX);
-    constants.translationY = static_cast<float>(used.offsetY);
     constants.imageWidth = static_cast<float>(textureWidth_);
     constants.imageHeight = static_cast<float>(textureHeight_);
-    constants.scale = static_cast<float>(used.scale);
+    if (used.useAffine)
+    {
+        constants.m00 = static_cast<float>(used.m00);
+        constants.m01 = static_cast<float>(used.m01);
+        constants.m10 = static_cast<float>(used.m10);
+        constants.m11 = static_cast<float>(used.m11);
+        constants.translationX = static_cast<float>(used.tx);
+        constants.translationY = static_cast<float>(used.ty);
+    }
+    else
+    {
+        if (used.scale <= 0.0)
+        {
+            used.scale = 1.0;
+        }
+        float const scale = static_cast<float>(used.scale);
+        constants.m00 = scale;
+        constants.m01 = 0.0f;
+        constants.m10 = 0.0f;
+        constants.m11 = scale;
+        constants.translationX = static_cast<float>(used.offsetX);
+        constants.translationY = static_cast<float>(used.offsetY);
+    }
     constants.opacity = ClampOpacity(opacity);
     std::memcpy(mapped.pData, &constants, sizeof(constants));
     context->Unmap(constants_.Get(), 0);
@@ -409,13 +434,35 @@ std::wstring ImageRenderer::FormatReport() const
     swprintf_s(opacityBuffer, L"%.3f", static_cast<double>(opacity_));
     text += opacityBuffer;
     text += L" placement offset=(";
-    wchar_t placeBuffer[64]{};
-    swprintf_s(placeBuffer, L"%.2f,%.2f) scale=%.5f", placement_.offsetX, placement_.offsetY, placement_.scale);
+    wchar_t placeBuffer[160]{};
+    if (placement_.useAffine)
+    {
+        swprintf_s(
+            placeBuffer,
+            L"%.2f,%.2f) affine=[[%.5f,%.5f,%.2f],[%.5f,%.5f,%.2f]]",
+            placement_.offsetX,
+            placement_.offsetY,
+            placement_.m00,
+            placement_.m01,
+            placement_.tx,
+            placement_.m10,
+            placement_.m11,
+            placement_.ty);
+    }
+    else
+    {
+        swprintf_s(
+            placeBuffer,
+            L"%.2f,%.2f) scale=%.5f",
+            placement_.offsetX,
+            placement_.offsetY,
+            placement_.scale);
+    }
     text += placeBuffer;
-    text += L" (explicit; texture unchanged by fit/reset/opacity)";
+    text += L" (explicit overlay-local; texture unchanged by fit/reset/opacity/affine)";
     text += L"\r\nlastHr=";
     text += FormatHresult(lastHr_);
-    text += L" present=overlay-dxgi-hwnd";
+    text += L" present=overlay-dxgi-hwnd scissor=overlay-rt";
     text += L" vs=";
     text += vsPath_.empty() ? L"(none)" : vsPath_;
     if (!lastError_.empty())
@@ -486,6 +533,7 @@ bool ImageRenderer::CreatePipeline(std::wstring& error)
     D3D11_RASTERIZER_DESC raster{};
     raster.FillMode = D3D11_FILL_SOLID;
     raster.CullMode = D3D11_CULL_NONE;
+    raster.ScissorEnable = TRUE;
     raster.DepthClipEnable = TRUE;
     hr = device_->Device()->CreateRasterizerState(&raster, &rasterizer_);
     if (FAILED(hr) || !rasterizer_)

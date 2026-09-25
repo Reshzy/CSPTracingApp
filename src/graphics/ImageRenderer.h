@@ -14,12 +14,21 @@
 
 namespace tracing::graphics {
 
-// GPU-free explicit placement in overlay-local pixels. Not M_RD / tracking.
+// GPU-free overlay-local placement. Axis-aligned offset/scale is used when
+// useAffine is false (ReferenceWindow fit/reset). Calibrated overlay drawing
+// sets useAffine from composed M_RO; this is not tracking.
 struct ImagePlacement
 {
     double offsetX = 0.0;
     double offsetY = 0.0;
     double scale = 1.0;
+    bool useAffine = false;
+    double m00 = 1.0;
+    double m01 = 0.0;
+    double m10 = 0.0;
+    double m11 = 1.0;
+    double tx = 0.0;
+    double ty = 0.0;
 };
 
 inline float ClampOpacity(float opacity) noexcept
@@ -190,7 +199,7 @@ inline void ImageRenderer::SetOpacity(float opacity) noexcept
 inline void ImageRenderer::SetPlacement(ImagePlacement const& placement) noexcept
 {
     placement_ = placement;
-    if (placement_.scale <= 0.0)
+    if (!placement_.useAffine && placement_.scale <= 0.0)
     {
         placement_.scale = 1.0;
     }

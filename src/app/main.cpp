@@ -292,29 +292,32 @@ void ApplyDerivedImagePlacement(ControlState& state)
     std::optional<tracing::core::Transform2D> const mRs = tracing::core::Compose(mRd, mDs);
     std::optional<tracing::core::Transform2D> const mRo =
         mRs.has_value() ? tracing::core::Compose(*mRs, mSo) : std::nullopt;
-    if (!mRo.has_value())
-    {
-        state.calibration.axisAlignedPlacement = false;
-        return;
-    }
-
-    std::optional<tracing::core::AxisAlignedPlacement> const placement =
-        tracing::core::TryAxisAlignedOverlayPlacement(
-            *mRo,
-            static_cast<double>(state.renderer.TextureWidth()),
-            static_cast<double>(state.renderer.TextureHeight()));
-    if (!placement.has_value())
+    if (!mRo.has_value() || mRo->from != tracing::core::Space::R ||
+        mRo->to != tracing::core::Space::O || !tracing::core::IsFinite(*mRo) ||
+        tracing::core::IsSingular(*mRo))
     {
         state.calibration.axisAlignedPlacement = false;
         return;
     }
 
     tracing::graphics::ImagePlacement overlayPlacement{};
-    overlayPlacement.offsetX = placement->offsetX;
-    overlayPlacement.offsetY = placement->offsetY;
-    overlayPlacement.scale = placement->scale;
+    overlayPlacement.useAffine = true;
+    overlayPlacement.m00 = mRo->matrix.m[0];
+    overlayPlacement.m01 = mRo->matrix.m[3];
+    overlayPlacement.m10 = mRo->matrix.m[1];
+    overlayPlacement.m11 = mRo->matrix.m[4];
+    overlayPlacement.tx = mRo->matrix.m[6];
+    overlayPlacement.ty = mRo->matrix.m[7];
+    overlayPlacement.offsetX = overlayPlacement.tx;
+    overlayPlacement.offsetY = overlayPlacement.ty;
+    overlayPlacement.scale = overlayPlacement.m00;
     state.renderer.SetPlacement(overlayPlacement);
-    state.calibration.axisAlignedPlacement = true;
+    state.calibration.axisAlignedPlacement =
+        tracing::core::TryAxisAlignedOverlayPlacement(
+            *mRo,
+            static_cast<double>(state.renderer.TextureWidth()),
+            static_cast<double>(state.renderer.TextureHeight()))
+            .has_value();
 }
 
 tracing::core::CalibrationReport MakeCalibrationReport(ControlState const& state)
@@ -1880,7 +1883,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         CreateWindowExW(
             0,
             L"STATIC",
-            L"blank Doc=local units; M_DS zoom is relative not CSP %; rot/flip numerical until substep B",
+            L"blank Doc=local units; M_DS zoom is relative not CSP %; rot/flip via overlay-local affine + RS scissor",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             388,
             434,
