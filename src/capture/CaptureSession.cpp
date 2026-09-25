@@ -126,6 +126,8 @@ struct CaptureSession::Impl
     std::wstring roiReport{L"roi (none)"};
     std::wstring roiSrc{L"full-content-fallback"};
     CanvasRoiRequest canvasRoi{};
+    RoiCpuSnapshot lastRoiBuffer{};
+    bool hasRoiBuffer = false;
 
     void OnFrameArrived(wgc::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&);
     void OnClosed(wgc::GraphicsCaptureItem const&, winrt::Windows::Foundation::IInspectable const&);
@@ -218,6 +220,8 @@ void CaptureSession::Impl::TeardownResources() noexcept
         local.swap(pending);
         device = nullptr;
         hasOwnedFrame = false;
+        hasRoiBuffer = false;
+        lastRoiBuffer = {};
     }
     for (auto& queued : local)
     {
@@ -789,6 +793,23 @@ void CaptureSession::PumpHandoff()
         {
             impl_->roiSrc = std::move(lastRoiSrc);
         }
+        if (impl_->roiReadback.HasBuffer())
+        {
+            RoiCpuBuffer const& packed = impl_->roiReadback.LastBuffer();
+            RoiCpuSnapshot snapshot{};
+            snapshot.sequence = packed.meta.sequence;
+            snapshot.captureTicks = packed.meta.captureTicks;
+            snapshot.targetGeneration = packed.meta.targetGeneration;
+            snapshot.geometryGeneration = packed.meta.geometryGeneration;
+            snapshot.width = packed.width;
+            snapshot.height = packed.height;
+            snapshot.stride = packed.stride;
+            snapshot.downsample = packed.downsample;
+            snapshot.bgra = packed.bgra;
+            snapshot.valid = packed.width > 0 && packed.height > 0 && !packed.bgra.empty();
+            impl_->lastRoiBuffer = std::move(snapshot);
+            impl_->hasRoiBuffer = impl_->lastRoiBuffer.valid;
+        }
         if (copied)
         {
             impl_->lastPacket = latest.packet;
@@ -834,6 +855,26 @@ bool CaptureSession::HasOwnedFrame() const noexcept
     }
     std::lock_guard<std::mutex> const lock(impl_->mutex);
     return impl_->hasOwnedFrame;
+}
+
+bool CaptureSession::HasRoiBuffer() const noexcept
+{
+    if (!impl_)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->hasRoiBuffer;
+}
+
+RoiCpuSnapshot CaptureSession::LastRoiBuffer() const
+{
+    if (!impl_)
+    {
+        return {};
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->lastRoiBuffer;
 }
 
 void CaptureSession::NoteGeometryGeneration(std::uint64_t geometryGeneration) noexcept

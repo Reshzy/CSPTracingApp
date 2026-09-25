@@ -37,9 +37,26 @@ add_executable(TracingApp WIN32
     src/image/ImageLoader.cpp
     src/core/Transform2D.cpp
     src/core/Calibration.cpp
+    src/tracking/VisualTracker.cpp
+    src/tracking/TrackingSession.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
-target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid gdi32 comctl32 WindowsApp windowscodecs ole32 uuid shell32)
+target_link_libraries(TracingApp PRIVATE
+    dwmapi
+    d3d11
+    dxgi
+    dxguid
+    gdi32
+    comctl32
+    WindowsApp
+    windowscodecs
+    ole32
+    uuid
+    shell32
+    opencv_core
+    opencv_imgproc
+    opencv_features2d
+    opencv_calib3d)
 
 set(_fxc_hints)
 if(DEFINED ENV{WindowsSdkVerBinPath})
@@ -189,6 +206,19 @@ target_link_libraries(TracingApp.VisualTrackerTests PRIVATE
     opencv_features2d
     opencv_calib3d)
 
+add_executable(TracingApp.TrackingSessionTests
+    tests/unit/TrackingSessionTests.cpp
+    src/tracking/TrackingSession.cpp
+    src/tracking/VisualTracker.cpp
+    src/core/Transform2D.cpp)
+tracing_app_apply_first_party_options(TracingApp.TrackingSessionTests)
+target_link_libraries(TracingApp.TrackingSessionTests PRIVATE
+    GTest::gtest_main
+    opencv_core
+    opencv_imgproc
+    opencv_features2d
+    opencv_calib3d)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -205,4 +235,5 @@ add_test(NAME TracingApp.TransformTests COMMAND TracingApp.TransformTests)
 add_test(NAME TracingApp.CalibrationTests COMMAND TracingApp.CalibrationTests)
 add_test(NAME TracingApp.RoiTests COMMAND TracingApp.RoiTests)
 add_test(NAME TracingApp.VisualTrackerTests COMMAND TracingApp.VisualTrackerTests)
+add_test(NAME TracingApp.TrackingSessionTests COMMAND TracingApp.TrackingSessionTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)

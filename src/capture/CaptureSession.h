@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace tracing::capture {
 
@@ -83,6 +84,22 @@ struct CanvasRoiRequest
     int captureH = 0;
 };
 
+// Owned packed BGRA copy of the latest completed canvas ROI. Copied out of
+// RoiReadback so the tracking worker can take it without racing the next map.
+struct RoiCpuSnapshot
+{
+    std::uint64_t sequence = 0;
+    std::int64_t captureTicks = 0;
+    std::uint64_t targetGeneration = 0;
+    std::uint64_t geometryGeneration = 0;
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+    int downsample = 1;
+    bool valid = false;
+    std::vector<std::uint8_t> bgra;
+};
+
 // GPU-free lifecycle and bounded handoff policy. Missing WGC support is
 // Unsupported, never Failed. Sequence increments only on accepted frames.
 class CaptureSessionPolicy
@@ -152,6 +169,8 @@ public:
     CaptureSessionState State() const noexcept;
     FramePacket LastPacket() const;
     bool HasOwnedFrame() const noexcept;
+    bool HasRoiBuffer() const noexcept;
+    RoiCpuSnapshot LastRoiBuffer() const;
     // Borrowed; valid on the graphics/UI thread until Stop/OnItemClosed.
     ID3D11Texture2D* BorrowOwnedTexture() const noexcept;
     std::wstring FormatReport() const;

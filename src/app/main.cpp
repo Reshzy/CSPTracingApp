@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <numbers>
 #include <optional>
 #include <string>
@@ -39,6 +40,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
 #include "app/ReferenceWindow.h"
+#include "tracking/TrackingSession.h"
 
 namespace {
 constexpr int kDefaultWidth = 720;
@@ -93,6 +95,9 @@ constexpr int kIdCanvasRotLeft = 1045;
 constexpr int kIdCanvasRotRight = 1046;
 constexpr int kIdCanvasFlipX = 1047;
 constexpr int kIdCanvasFlipY = 1048;
+constexpr int kIdStartTracking = 1049;
+constexpr int kIdPauseTracking = 1050;
+constexpr int kIdResyncTracking = 1051;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -124,6 +129,7 @@ struct LiveCalibration
     tracing::core::CalibrationInvalidation lastInvalidation =
         tracing::core::CalibrationInvalidation::None;
     bool axisAlignedPlacement = true;
+    std::uint64_t calibrationGeneration = 0;
 };
 
 struct ControlState
@@ -142,6 +148,7 @@ struct ControlState
     tracing::image::LoadedImageSlot image;
     tracing::graphics::ImageRenderer renderer;
     tracing::app::ReferenceWindow reference;
+    tracing::tracking::TrackingSession tracking;
     HWND previewCheck = nullptr;
     HWND opacityTrack = nullptr;
     HWND obsPositiveControlCheck = nullptr;
@@ -156,6 +163,10 @@ struct ControlState
     bool hideOverlayOnCaptureLoss = false;
     bool obsSkipOverlayImagePresent = false;
     std::uint64_t nextGeneration = 1;
+    std::uint64_t lastFedRoiSequence = 0;
+    bool lastRoiFeedValid = false;
+    tracing::tracking::TrackingFrameAction lastRoiFeedAction =
+        tracing::tracking::TrackingFrameAction::RejectNotCalibrated;
 };
 
 std::wstring ControlDpiLine(HWND hwnd)
@@ -275,11 +286,20 @@ void SyncCanvasRoiRequest(ControlState& state)
     state.capture.SetCanvasRoiRequest(request);
 }
 
+void ResetRoiFeed(ControlState& state) noexcept
+{
+    state.lastFedRoiSequence = 0;
+    state.lastRoiFeedValid = false;
+    state.lastRoiFeedAction = tracing::tracking::TrackingFrameAction::RejectNotCalibrated;
+}
+
 void ResetLiveCalibration(ControlState& state)
 {
     state.calibration = LiveCalibration{};
     state.calibration.mRd = tracing::core::ResetReferenceAlignment();
     state.calibration.zoom = 1.0;
+    state.tracking.Detach();
+    ResetRoiFeed(state);
     SyncCanvasRoiRequest(state);
 }
 
@@ -313,6 +333,12 @@ tracing::core::Vec2 ClientOriginFromGeometry(tracing::platform::GeometrySnapshot
         static_cast<double>(geometry.clientPhysical.y)};
 }
 
+bool TrackingUsesSnapshotMds(tracing::tracking::TrackingState state) noexcept
+{
+    return state != tracing::tracking::TrackingState::Unattached &&
+           state != tracing::tracking::TrackingState::Unavailable;
+}
+
 void ApplyDerivedImagePlacement(ControlState& state)
 {
     if (!state.renderer.HasTexture() || !CalibrationIsLive(state))
@@ -325,13 +351,16 @@ void ApplyDerivedImagePlacement(ControlState& state)
         tracing::core::RoiScreenOrigin(clientOrigin, state.calibration.roi);
     tracing::core::Transform2D const mRd =
         tracing::core::MakeAlignedReferenceToDocument(state.calibration.mRd);
-    tracing::core::Transform2D const mDs = tracing::core::MakeDocumentToScreen(
-        overlayOrigin,
-        state.calibration.canvasRadians,
-        state.calibration.zoom,
-        state.calibration.canvasFlipX,
-        state.calibration.canvasFlipY,
-        state.calibration.documentAnchor);
+    tracing::tracking::TransformSnapshot const tracking = state.tracking.Snapshot();
+    tracing::core::Transform2D const mDs = TrackingUsesSnapshotMds(tracking.state)
+        ? tracking.mDs
+        : tracing::core::MakeDocumentToScreen(
+              overlayOrigin,
+              state.calibration.canvasRadians,
+              state.calibration.zoom,
+              state.calibration.canvasFlipX,
+              state.calibration.canvasFlipY,
+              state.calibration.documentAnchor);
     tracing::core::Transform2D const mSo = tracing::core::MakeScreenToOverlay(overlayOrigin);
     std::optional<tracing::core::Transform2D> const mRs = tracing::core::Compose(mRd, mDs);
     std::optional<tracing::core::Transform2D> const mRo =
@@ -416,6 +445,8 @@ void RefreshCalibrationValidity(ControlState& state)
     {
         state.calibration.roiApplied = false;
         state.calibration.lastInvalidation = reason;
+        state.tracking.Detach();
+        ResetRoiFeed(state);
     }
 }
 
@@ -477,6 +508,11 @@ std::wstring StatusHeader(ControlState const& state)
            L" (temporary OBS-gate diagnostic)\r\n"
            L"Transform diag: canned pR=(10,5)->pO=(2040,102); numerical only (not tracking)\r\n" +
            WidenAscii(tracing::core::FormatCalibrationReport(MakeCalibrationReport(state))) +
+           L"\r\n" + WidenAscii(state.tracking.FormatReport()) + L"\r\n"
+           L"roiFeed seq=" +
+           std::to_wstring(state.lastFedRoiSequence) + L" valid=" +
+           std::wstring(state.lastRoiFeedValid ? L"yes" : L"no") + L" action=" +
+           WidenAscii(tracing::tracking::FormatTrackingFrameAction(state.lastRoiFeedAction)) +
            L"\r\n";
 }
 
@@ -488,9 +524,52 @@ void SetStatus(ControlState& state, std::wstring const& text)
     }
 }
 
+void FeedTrackingFromRoi(ControlState& state)
+{
+    tracing::tracking::TrackingState const trackingState = state.tracking.Snapshot().state;
+    if (trackingState == tracing::tracking::TrackingState::Unattached ||
+        trackingState == tracing::tracking::TrackingState::Unavailable ||
+        trackingState == tracing::tracking::TrackingState::Paused)
+    {
+        return;
+    }
+    if (!state.capture.HasRoiBuffer())
+    {
+        return;
+    }
+
+    tracing::capture::RoiCpuSnapshot snapshot = state.capture.LastRoiBuffer();
+    if (!snapshot.valid || snapshot.sequence == 0)
+    {
+        return;
+    }
+    if (state.lastRoiFeedValid && snapshot.sequence == state.lastFedRoiSequence)
+    {
+        return;
+    }
+
+    tracing::tracking::TrackingRoiFrame frame{};
+    frame.meta.sequence = snapshot.sequence;
+    frame.meta.captureTicks = snapshot.captureTicks;
+    frame.meta.targetGeneration = snapshot.targetGeneration;
+    frame.meta.geometryGeneration = snapshot.geometryGeneration;
+    frame.meta.calibrationGeneration = state.calibration.calibrationGeneration;
+    frame.meta.width = snapshot.width;
+    frame.meta.height = snapshot.height;
+    frame.meta.stride = snapshot.stride;
+    frame.meta.downsample = snapshot.downsample < 1 ? 1 : snapshot.downsample;
+    frame.bgra = std::move(snapshot.bgra);
+
+    state.lastFedRoiSequence = snapshot.sequence;
+    state.lastRoiFeedValid = true;
+    state.lastRoiFeedAction = state.tracking.SubmitRoiFrame(std::move(frame));
+}
+
 void StopCapture(ControlState& state)
 {
     state.capture.Stop();
+    state.tracking.Detach();
+    ResetRoiFeed(state);
     SyncCanvasRoiRequest(state);
     if (state.preview.IsEnabled())
     {
@@ -568,7 +647,7 @@ void SyncOverlayFromState(ControlState& state)
             placement = {};
             targetUsable = false;
         }
-        if (state.hideOverlayOnCaptureLoss)
+        if (state.hideOverlayOnCaptureLoss || state.tracking.Snapshot().hideOverlay)
         {
             targetUsable = false;
         }
@@ -670,6 +749,15 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
     RefreshCalibrationValidity(state);
     state.capture.NoteGeometryGeneration(sampled.geometryGeneration);
     SyncCanvasRoiRequest(state);
+    if (CalibrationIsLive(state))
+    {
+        tracing::core::Vec2 const overlayOrigin = tracing::core::RoiScreenOrigin(
+            ClientOriginFromGeometry(sampled),
+            state.calibration.roi);
+        state.tracking.NoteGeometryGeneration(sampled.geometryGeneration);
+        state.tracking.SetViewportAnchorS(overlayOrigin);
+    }
+    state.tracking.Tick(std::chrono::steady_clock::now());
     std::wstring body = tracing::platform::FormatGeometryReport(sampled);
     if (!extra.empty())
     {
@@ -1279,12 +1367,13 @@ void OnApplyRoi(ControlState& state)
     state.calibration.declaredDocW = declaredW;
     state.calibration.declaredDocH = declaredH;
     state.calibration.lastInvalidation = tracing::core::CalibrationInvalidation::None;
+    ++state.calibration.calibrationGeneration;
     ApplyDerivedImagePlacement(state);
     SyncCanvasRoiRequest(state);
     SetStatusWithOverlay(
         state,
         L"Applied canvas ROI in client-relative pixels. Overlay HWND clipped to ROI. "
-        L"Window move updates M_SO only. tracking=disabled.");
+        L"Window move updates M_SO only. Start tracking after alignment.");
 }
 
 bool HandleCalibrationCommand(ControlState& state, int id)
@@ -1374,8 +1463,74 @@ bool HandleCalibrationCommand(ControlState& state, int id)
     ApplyDerivedImagePlacement(state);
     SetStatusWithOverlay(
         state,
-        L"Manual calibration updated (M_RD alignment vs M_DS canvas; tracking=disabled).");
+        L"Manual calibration updated (M_RD alignment vs M_DS canvas). Tracking uses the "
+        L"current M_DS only after Start tracking.");
     return true;
+}
+
+void OnStartTracking(ControlState& state)
+{
+    if (!CalibrationIsLive(state) || !state.selected.has_value())
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Start tracking: apply a live canvas ROI on a selected target first.");
+        return;
+    }
+
+    tracing::core::Vec2 const overlayOrigin = tracing::core::RoiScreenOrigin(
+        ClientOriginFromGeometry(state.lastGeometry),
+        state.calibration.roi);
+    tracing::core::Transform2D const mDs = tracing::core::MakeDocumentToScreen(
+        overlayOrigin,
+        state.calibration.canvasRadians,
+        state.calibration.zoom,
+        state.calibration.canvasFlipX,
+        state.calibration.canvasFlipY,
+        state.calibration.documentAnchor);
+    tracing::core::Transform2D const mSo = tracing::core::MakeScreenToOverlay(overlayOrigin);
+    std::string error;
+    ResetRoiFeed(state);
+    if (!state.tracking.BeginCalibrated(
+            state.selected->sessionGeneration,
+            state.lastGeometry.geometryGeneration,
+            state.calibration.calibrationGeneration,
+            mDs,
+            mSo,
+            overlayOrigin,
+            error))
+    {
+        SetStatusWithOverlay(state, L"Start tracking failed: " + WidenAscii(error));
+        return;
+    }
+    FeedTrackingFromRoi(state);
+    SetStatusWithOverlay(
+        state,
+        L"Tracking Calibrating. ROI CPU buffers feed the worker; hide-on-Lost is armed.");
+}
+
+void OnPauseTracking(ControlState& state)
+{
+    tracing::tracking::TrackingState const current = state.tracking.Snapshot().state;
+    if (current == tracing::tracking::TrackingState::Paused)
+    {
+        state.tracking.Resume();
+        SetStatusWithOverlay(state, L"Tracking resumed.");
+        return;
+    }
+    state.tracking.Pause();
+    SetStatusWithOverlay(state, L"Tracking paused.");
+}
+
+void OnResyncTracking(ControlState& state)
+{
+    state.tracking.Resync();
+    if (CalibrationIsLive(state) && state.selected.has_value())
+    {
+        OnStartTracking(state);
+        return;
+    }
+    SetStatusWithOverlay(state, L"Tracking resync: detached (apply ROI, then Start tracking).");
 }
 
 void OnShowReference(ControlState& state)
@@ -1817,6 +1972,45 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdTransformDiag)),
             instance,
             nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Start tracking",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            180,
+            376,
+            124,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStartTracking)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Pause",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            310,
+            376,
+            72,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdPauseTracking)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Resync",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            388,
+            376,
+            72,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdResyncTracking)),
+            instance,
+            nullptr);
         auto addButton = [&](wchar_t const* title, int x, int y, int w, int h, int id)
         {
             CreateWindowExW(
@@ -2078,6 +2272,21 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 OnTransformDiag(*state);
                 return 0;
             }
+            if (id == kIdStartTracking && code == BN_CLICKED)
+            {
+                OnStartTracking(*state);
+                return 0;
+            }
+            if (id == kIdPauseTracking && code == BN_CLICKED)
+            {
+                OnPauseTracking(*state);
+                return 0;
+            }
+            if (id == kIdResyncTracking && code == BN_CLICKED)
+            {
+                OnResyncTracking(*state);
+                return 0;
+            }
             if (code == BN_CLICKED && HandleCalibrationCommand(*state, id))
             {
                 return 0;
@@ -2110,6 +2319,8 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (wParam == 1)
             {
                 state->capture.OnItemClosed();
+                state->tracking.MarkUnavailable();
+                ResetRoiFeed(*state);
                 state->hideOverlayOnCaptureLoss = true;
                 PresentPreview(*state);
                 RefreshGeometryDisplay(*state, L"WGC item Closed; session torn down; tracing overlay hidden.");
@@ -2118,6 +2329,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             RefreshCalibrationValidity(*state);
             SyncCanvasRoiRequest(*state);
             state->capture.PumpHandoff();
+            FeedTrackingFromRoi(*state);
             tracing::capture::FramePacket const packet = state->capture.LastPacket();
             if (packet.stale)
             {
@@ -2160,6 +2372,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (state != nullptr)
         {
             StopCapture(*state);
+            state->tracking.Stop();
             StopWatching(*state);
             state->reference.Release();
             state->preview.Release();
