@@ -1,0 +1,707 @@
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#include "capture/CaptureSession.h"
+
+#include <Unknwn.h>
+#include <windows.graphics.capture.interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+
+#include <dxgi.h>
+#include <wrl/client.h>
+
+#include <cstdio>
+#include <deque>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+namespace tracing::capture {
+namespace {
+
+namespace wgc = winrt::Windows::Graphics::Capture;
+namespace wgd = winrt::Windows::Graphics::DirectX;
+namespace wgd3d = winrt::Windows::Graphics::DirectX::Direct3D11;
+
+std::wstring FormatHresult(HRESULT value)
+{
+    wchar_t buffer[16]{};
+    swprintf_s(buffer, L"0x%08X", static_cast<unsigned>(value));
+    return buffer;
+}
+
+void CloseFrameQuiet(wgc::Direct3D11CaptureFrame& frame) noexcept
+{
+    if (!frame)
+    {
+        return;
+    }
+    try
+    {
+        frame.Close();
+    }
+    catch (...)
+    {
+    }
+    frame = nullptr;
+}
+
+winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice WrapD3dDevice(ID3D11Device* device)
+{
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+    winrt::check_hresult(device->QueryInterface(IID_PPV_ARGS(&dxgiDevice)));
+    winrt::com_ptr<::IInspectable> inspectable;
+    winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.Get(), inspectable.put()));
+    return inspectable.as<wgd3d::IDirect3DDevice>();
+}
+
+wgc::GraphicsCaptureItem CreateItemForWindow(HWND hwnd)
+{
+    auto const factory = winrt::get_activation_factory<wgc::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+    wgc::GraphicsCaptureItem item{nullptr};
+    winrt::check_hresult(factory->CreateForWindow(
+        hwnd,
+        winrt::guid_of<wgc::GraphicsCaptureItem>(),
+        winrt::put_abi(item)));
+    return item;
+}
+
+Microsoft::WRL::ComPtr<ID3D11Texture2D> TextureFromSurface(wgd3d::IDirect3DSurface const& surface)
+{
+    auto const access = surface.as<Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+    winrt::check_hresult(access->GetInterface(IID_PPV_ARGS(&texture)));
+    return texture;
+}
+
+} // namespace
+
+struct CaptureSession::Impl
+{
+    mutable std::mutex mutex;
+    CaptureSessionPolicy policy;
+    FramePacket lastPacket{};
+    HRESULT lastHr = S_OK;
+    bool supported = false;
+    bool supportChecked = false;
+    bool itemClosed = false;
+    bool hasOwnedFrame = false;
+    std::uint64_t targetGeneration = 0;
+    std::uint64_t geometryGeneration = 0;
+    HWND notifyWindow = nullptr;
+    UINT notifyMessage = 0;
+    graphics::DeviceResources* device = nullptr;
+
+    wgd3d::IDirect3DDevice winrtDevice{nullptr};
+    wgc::GraphicsCaptureItem item{nullptr};
+    wgc::Direct3D11CaptureFramePool framePool{nullptr};
+    wgc::GraphicsCaptureSession session{nullptr};
+    winrt::event_token arrivedToken{};
+    winrt::event_token closedToken{};
+
+    struct PendingItem
+    {
+        wgc::Direct3D11CaptureFrame frame{nullptr};
+        FramePacket packet{};
+    };
+    std::deque<PendingItem> pending;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> ownedTexture;
+    UINT ownedWidth = 0;
+    UINT ownedHeight = 0;
+    DXGI_FORMAT ownedFormat = DXGI_FORMAT_UNKNOWN;
+
+    void OnFrameArrived(wgc::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&);
+    void OnClosed(wgc::GraphicsCaptureItem const&, winrt::Windows::Foundation::IInspectable const&);
+    void RevokeEvents() noexcept;
+    void CloseSessionAndPool() noexcept;
+    void TeardownResources() noexcept;
+    bool CopyOwned(PendingItem& pendingItem, HRESULT& copyHr, std::wstring& error);
+};
+
+CaptureSession::CaptureSession() : impl_(std::make_unique<Impl>()) {}
+
+CaptureSession::~CaptureSession()
+{
+    Stop();
+}
+
+void CaptureSession::Impl::RevokeEvents() noexcept
+{
+    try
+    {
+        if (framePool && arrivedToken)
+        {
+            framePool.FrameArrived(arrivedToken);
+        }
+    }
+    catch (...)
+    {
+    }
+    arrivedToken = {};
+    try
+    {
+        if (item && closedToken)
+        {
+            item.Closed(closedToken);
+        }
+    }
+    catch (...)
+    {
+    }
+    closedToken = {};
+}
+
+void CaptureSession::Impl::CloseSessionAndPool() noexcept
+{
+    try
+    {
+        if (session)
+        {
+            session.Close();
+        }
+    }
+    catch (...)
+    {
+    }
+    session = nullptr;
+    try
+    {
+        if (framePool)
+        {
+            framePool.Close();
+        }
+    }
+    catch (...)
+    {
+    }
+    framePool = nullptr;
+    item = nullptr;
+    try
+    {
+        if (winrtDevice)
+        {
+            winrtDevice.Close();
+        }
+    }
+    catch (...)
+    {
+    }
+    winrtDevice = nullptr;
+}
+
+void CaptureSession::Impl::TeardownResources() noexcept
+{
+    RevokeEvents();
+    CloseSessionAndPool();
+
+    std::deque<PendingItem> local;
+    {
+        std::lock_guard<std::mutex> const lock(mutex);
+        local.swap(pending);
+        device = nullptr;
+        hasOwnedFrame = false;
+    }
+    for (auto& queued : local)
+    {
+        CloseFrameQuiet(queued.frame);
+    }
+
+    ownedTexture.Reset();
+    ownedWidth = 0;
+    ownedHeight = 0;
+    ownedFormat = DXGI_FORMAT_UNKNOWN;
+}
+
+void CaptureSession::Impl::OnClosed(
+    wgc::GraphicsCaptureItem const&,
+    winrt::Windows::Foundation::IInspectable const&)
+{
+    HWND notify = nullptr;
+    UINT message = 0;
+    {
+        std::lock_guard<std::mutex> const lock(mutex);
+        itemClosed = true;
+        policy.Apply(CaptureSessionEvent::ItemClosed);
+        notify = notifyWindow;
+        message = notifyMessage;
+    }
+    if (notify != nullptr && message != 0)
+    {
+        PostMessageW(notify, message, 1, 0);
+    }
+}
+
+void CaptureSession::Impl::OnFrameArrived(
+    wgc::Direct3D11CaptureFramePool const& sender,
+    winrt::Windows::Foundation::IInspectable const&)
+{
+    wgc::Direct3D11CaptureFrame frame{nullptr};
+    try
+    {
+        frame = sender.TryGetNextFrame();
+    }
+    catch (winrt::hresult_error const& error)
+    {
+        std::lock_guard<std::mutex> const lock(mutex);
+        lastHr = error.code();
+        return;
+    }
+    catch (...)
+    {
+        return;
+    }
+    if (!frame)
+    {
+        return;
+    }
+
+    winrt::Windows::Graphics::SizeInt32 size{};
+    winrt::Windows::Foundation::TimeSpan timestamp{};
+    try
+    {
+        size = frame.ContentSize();
+        timestamp = frame.SystemRelativeTime();
+    }
+    catch (...)
+    {
+        CloseFrameQuiet(frame);
+        return;
+    }
+
+    CaptureFrameArrival arrival{};
+    HWND notify = nullptr;
+    UINT message = 0;
+    CaptureHandoffResult result{};
+    PendingItem dropped{};
+    bool post = false;
+    bool closeNow = true;
+
+    {
+        std::lock_guard<std::mutex> const lock(mutex);
+        arrival.targetGeneration = targetGeneration;
+        arrival.contentWidth = size.Width;
+        arrival.contentHeight = size.Height;
+        result = policy.Arrive(arrival);
+        notify = notifyWindow;
+        message = notifyMessage;
+
+        if (result.action == CaptureHandoffAction::DropOldestThenEnqueue && !pending.empty())
+        {
+            dropped = std::move(pending.front());
+            pending.pop_front();
+        }
+
+        if (result.action == CaptureHandoffAction::Enqueue ||
+            result.action == CaptureHandoffAction::DropOldestThenEnqueue)
+        {
+            PendingItem queued;
+            queued.frame = frame;
+            queued.packet.sequence = result.sequence;
+            queued.packet.captureTicks = timestamp.count();
+            queued.packet.contentWidth = size.Width;
+            queued.packet.contentHeight = size.Height;
+            queued.packet.targetGeneration = arrival.targetGeneration;
+            queued.packet.geometryGeneration = geometryGeneration;
+            queued.packet.stale = false;
+            pending.push_back(std::move(queued));
+            closeNow = false;
+            post = true;
+        }
+        else if (result.action == CaptureHandoffAction::StaleZeroSize)
+        {
+            lastPacket.sequence = policy.LastSequence();
+            lastPacket.captureTicks = timestamp.count();
+            lastPacket.contentWidth = size.Width;
+            lastPacket.contentHeight = size.Height;
+            lastPacket.targetGeneration = arrival.targetGeneration;
+            lastPacket.geometryGeneration = geometryGeneration;
+            lastPacket.stale = true;
+            post = true;
+        }
+    }
+
+    CloseFrameQuiet(dropped.frame);
+    if (closeNow)
+    {
+        CloseFrameQuiet(frame);
+    }
+    if (post && notify != nullptr && message != 0)
+    {
+        PostMessageW(notify, message, 0, 0);
+    }
+}
+
+bool CaptureSession::Impl::CopyOwned(PendingItem& pendingItem, HRESULT& copyHr, std::wstring& error)
+{
+    error.clear();
+    copyHr = S_OK;
+    graphics::DeviceResources* gpu = nullptr;
+    {
+        std::lock_guard<std::mutex> const lock(mutex);
+        gpu = device;
+    }
+    if (!pendingItem.frame || gpu == nullptr || !gpu->IsReady())
+    {
+        CloseFrameQuiet(pendingItem.frame);
+        error = L"Cannot copy WGC frame: device not ready.";
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
+    try
+    {
+        source = TextureFromSurface(pendingItem.frame.Surface());
+    }
+    catch (winrt::hresult_error const& hrError)
+    {
+        copyHr = hrError.code();
+        CloseFrameQuiet(pendingItem.frame);
+        error = L"GetInterface ID3D11Texture2D failed HRESULT=" + FormatHresult(copyHr);
+        return false;
+    }
+    catch (...)
+    {
+        CloseFrameQuiet(pendingItem.frame);
+        error = L"GetInterface ID3D11Texture2D failed.";
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    source->GetDesc(&desc);
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = 0;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+
+    if (!ownedTexture || ownedWidth != desc.Width || ownedHeight != desc.Height ||
+        ownedFormat != desc.Format)
+    {
+        ownedTexture.Reset();
+        copyHr = gpu->Device()->CreateTexture2D(&desc, nullptr, &ownedTexture);
+        if (FAILED(copyHr) || !ownedTexture)
+        {
+            CloseFrameQuiet(pendingItem.frame);
+            error = L"CreateTexture2D owned capture copy failed HRESULT=" + FormatHresult(copyHr);
+            return false;
+        }
+        ownedWidth = desc.Width;
+        ownedHeight = desc.Height;
+        ownedFormat = desc.Format;
+    }
+
+    gpu->ImmediateContext()->CopyResource(ownedTexture.Get(), source.Get());
+    CloseFrameQuiet(pendingItem.frame);
+    return true;
+}
+
+bool CaptureSession::Start(
+    HWND target,
+    std::uint64_t targetGeneration,
+    std::uint64_t geometryGeneration,
+    graphics::DeviceResources& device,
+    HWND notifyWindow,
+    UINT notifyMessage,
+    std::wstring& error)
+{
+    error.clear();
+    Stop();
+
+    if (target == nullptr || !IsWindow(target))
+    {
+        impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+        error = L"WGC Start requires a live target HWND.";
+        return false;
+    }
+    if (!device.IsReady() || device.Device() == nullptr)
+    {
+        impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+        error = L"WGC Start requires a ready BGRA D3D11 device.";
+        return false;
+    }
+    if (notifyWindow == nullptr)
+    {
+        impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+        error = L"WGC Start requires a notify HWND for owned-frame handoff.";
+        return false;
+    }
+
+    try
+    {
+        impl_->supportChecked = true;
+        impl_->supported = wgc::GraphicsCaptureSession::IsSupported();
+        if (!impl_->supported)
+        {
+            impl_->policy.Apply(CaptureSessionEvent::SupportMissing);
+            error = L"Windows Graphics Capture is not supported on this system.";
+            return false;
+        }
+        impl_->policy.Apply(CaptureSessionEvent::SupportPresent);
+    }
+    catch (winrt::hresult_error const& hrError)
+    {
+        impl_->lastHr = hrError.code();
+        impl_->supportChecked = true;
+        if (static_cast<HRESULT>(hrError.code()) == RPC_E_WRONG_THREAD)
+        {
+            impl_->supported = true;
+            impl_->policy.Apply(CaptureSessionEvent::SupportPresent);
+        }
+        else
+        {
+            impl_->supported = false;
+            impl_->policy.Apply(CaptureSessionEvent::SupportMissing);
+            error = L"GraphicsCaptureSession::IsSupported failed HRESULT=" +
+                    FormatHresult(impl_->lastHr);
+            return false;
+        }
+    }
+
+    try
+    {
+        impl_->winrtDevice = WrapD3dDevice(device.Device());
+        impl_->item = CreateItemForWindow(target);
+        auto const contentSize = impl_->item.Size();
+        if (contentSize.Width <= 0 || contentSize.Height <= 0)
+        {
+            impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+            error = L"GraphicsCaptureItem size is empty; cannot create frame pool.";
+            impl_->item = nullptr;
+            impl_->winrtDevice = nullptr;
+            return false;
+        }
+
+        impl_->framePool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+            impl_->winrtDevice,
+            wgd::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            contentSize);
+        impl_->session = impl_->framePool.CreateCaptureSession(impl_->item);
+        try
+        {
+            impl_->session.IsCursorCaptureEnabled(false);
+        }
+        catch (...)
+        {
+        }
+
+        {
+            std::lock_guard<std::mutex> const lock(impl_->mutex);
+            impl_->device = &device;
+            impl_->notifyWindow = notifyWindow;
+            impl_->notifyMessage = notifyMessage;
+            impl_->targetGeneration = targetGeneration;
+            impl_->geometryGeneration = geometryGeneration;
+            impl_->itemClosed = false;
+            impl_->hasOwnedFrame = false;
+            impl_->lastPacket = {};
+            impl_->lastHr = S_OK;
+            impl_->policy.SetSessionGeneration(targetGeneration);
+        }
+
+        impl_->arrivedToken = impl_->framePool.FrameArrived({impl_.get(), &Impl::OnFrameArrived});
+        impl_->closedToken = impl_->item.Closed({impl_.get(), &Impl::OnClosed});
+        {
+            std::lock_guard<std::mutex> const lock(impl_->mutex);
+            impl_->policy.Apply(CaptureSessionEvent::StartSucceeded);
+        }
+        impl_->session.StartCapture();
+        return true;
+    }
+    catch (winrt::hresult_error const& hrError)
+    {
+        impl_->lastHr = hrError.code();
+        impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+        error = L"WGC Start failed HRESULT=" + FormatHresult(impl_->lastHr);
+        Stop();
+        impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+        return false;
+    }
+    catch (...)
+    {
+        impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+        error = L"WGC Start failed with an unknown exception.";
+        Stop();
+        impl_->policy.Apply(CaptureSessionEvent::StartFailed);
+        return false;
+    }
+}
+
+void CaptureSession::Stop()
+{
+    if (!impl_)
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> const lock(impl_->mutex);
+        impl_->notifyWindow = nullptr;
+        impl_->policy.Apply(CaptureSessionEvent::Stop);
+    }
+    impl_->TeardownResources();
+}
+
+void CaptureSession::OnItemClosed()
+{
+    if (!impl_)
+    {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> const lock(impl_->mutex);
+        impl_->itemClosed = true;
+        impl_->notifyWindow = nullptr;
+        impl_->policy.Apply(CaptureSessionEvent::ItemClosed);
+    }
+    impl_->TeardownResources();
+}
+
+void CaptureSession::PumpHandoff()
+{
+    if (!impl_)
+    {
+        return;
+    }
+
+    std::vector<Impl::PendingItem> obsolete;
+    Impl::PendingItem latest{};
+    bool haveLatest = false;
+    {
+        std::lock_guard<std::mutex> const lock(impl_->mutex);
+        while (impl_->pending.size() > 1)
+        {
+            obsolete.push_back(std::move(impl_->pending.front()));
+            impl_->pending.pop_front();
+            impl_->policy.NoteDequeued();
+        }
+        if (!impl_->pending.empty())
+        {
+            latest = std::move(impl_->pending.front());
+            impl_->pending.pop_front();
+            impl_->policy.NoteDequeued();
+            haveLatest = true;
+        }
+    }
+
+    for (auto& queued : obsolete)
+    {
+        CloseFrameQuiet(queued.frame);
+    }
+    if (!haveLatest)
+    {
+        return;
+    }
+
+    HRESULT copyHr = S_OK;
+    std::wstring copyError;
+    bool const copied = impl_->CopyOwned(latest, copyHr, copyError);
+    {
+        std::lock_guard<std::mutex> const lock(impl_->mutex);
+        impl_->lastHr = copyHr;
+        if (copied)
+        {
+            impl_->lastPacket = latest.packet;
+            impl_->lastPacket.stale = false;
+            impl_->hasOwnedFrame = true;
+        }
+        else
+        {
+            impl_->hasOwnedFrame = false;
+        }
+    }
+}
+
+CaptureSessionState CaptureSession::State() const noexcept
+{
+    if (!impl_)
+    {
+        return CaptureSessionState::Idle;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->policy.State();
+}
+
+FramePacket CaptureSession::LastPacket() const
+{
+    if (!impl_)
+    {
+        return {};
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->lastPacket;
+}
+
+bool CaptureSession::HasOwnedFrame() const noexcept
+{
+    if (!impl_)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->hasOwnedFrame;
+}
+
+std::wstring CaptureSession::FormatReport() const
+{
+    if (!impl_)
+    {
+        return L"WGC session=(none)";
+    }
+
+    CaptureSessionPolicy policySnapshot;
+    FramePacket packet{};
+    HRESULT lastHr = S_OK;
+    bool supported = false;
+    bool supportChecked = false;
+    bool itemClosed = false;
+    bool hasOwned = false;
+    std::uint64_t targetGeneration = 0;
+    std::uint64_t geometryGeneration = 0;
+    {
+        std::lock_guard<std::mutex> const lock(impl_->mutex);
+        policySnapshot = impl_->policy;
+        packet = impl_->lastPacket;
+        lastHr = impl_->lastHr;
+        supported = impl_->supported;
+        supportChecked = impl_->supportChecked;
+        itemClosed = impl_->itemClosed;
+        hasOwned = impl_->hasOwnedFrame;
+        targetGeneration = impl_->targetGeneration;
+        geometryGeneration = impl_->geometryGeneration;
+    }
+
+    std::wstring supportText = L"unchecked";
+    if (supportChecked)
+    {
+        supportText = supported ? L"yes" : L"no";
+    }
+
+    return L"WGC supported=" + supportText + L" state=" + FormatCaptureSessionState(policySnapshot.State()) +
+           L" sessionGen=" + std::to_wstring(policySnapshot.SessionGeneration()) +
+           L" targetGen=" + std::to_wstring(targetGeneration) + L" geomGen=" +
+           std::to_wstring(geometryGeneration) + L"\r\n" + L"accepted=" +
+           std::to_wstring(policySnapshot.Accepted()) + L" droppedBound=" +
+           std::to_wstring(policySnapshot.DroppedBound()) + L" staleZero=" +
+           std::to_wstring(policySnapshot.Stale()) + L" rejectedGen=" +
+           std::to_wstring(policySnapshot.RejectedGeneration()) + L" pending=" +
+           std::to_wstring(policySnapshot.Pending()) + L" lastSeq=" +
+           std::to_wstring(packet.sequence) + L" contentSize=" +
+           std::to_wstring(packet.contentWidth) + L"x" + std::to_wstring(packet.contentHeight) +
+           L" captureTicks=" + std::to_wstring(packet.captureTicks) + L" stale=" +
+           (packet.stale ? L"yes" : L"no") + L"\r\n" + L"itemClosed=" + (itemClosed ? L"yes" : L"no") +
+           L" ownedFrame=" + (hasOwned ? L"yes" : L"no") + L" lastHr=" + FormatHresult(lastHr) +
+           L" (WGC copies only; overlay test-pattern is not a captured frame)";
+}
+
+} // namespace tracing::capture

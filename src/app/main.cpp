@@ -16,6 +16,10 @@ bool IsValidControlViewport(int width, int height) noexcept
 
 #ifndef TRACING_APP_TESTING
 
+#include <Unknwn.h>
+#include <winrt/base.h>
+
+#include "capture/CaptureSession.h"
 #include "graphics/DeviceResources.h"
 #include "graphics/OverlaySurface.h"
 #include "platform/TargetDiscovery.h"
@@ -35,7 +39,12 @@ constexpr int kIdShowMarker = 1006;
 constexpr int kIdTracingMode = 1007;
 constexpr int kIdAlignmentMode = 1008;
 constexpr int kIdCoverProbe = 1009;
+constexpr int kIdStartCapture = 1010;
+constexpr int kIdStopCapture = 1011;
 constexpr UINT kMsgGeometry = WM_APP + 1;
+constexpr UINT kMsgCapture = WM_APP + 2;
+constexpr UINT kMsgStartCapture = WM_APP + 3;
+constexpr UINT kMsgStopCapture = WM_APP + 4;
 constexpr UINT_PTR kTimerGeometry = 1;
 constexpr UINT kGeometryPollMs = 250;
 
@@ -50,6 +59,7 @@ struct ControlState
     tracing::platform::GeometrySnapshot lastGeometry;
     tracing::graphics::DeviceResources device;
     tracing::graphics::OverlaySurface overlay;
+    tracing::capture::CaptureSession capture;
     std::uint64_t nextGeneration = 1;
 };
 
@@ -63,7 +73,7 @@ std::wstring ControlDpiLine(HWND hwnd)
 std::wstring StatusHeader(ControlState const& state)
 {
     return ControlDpiLine(state.control) + state.device.FormatReport() + L"\r\n" +
-           state.overlay.FormatReport() + L"\r\n";
+           state.overlay.FormatReport() + L"\r\n" + state.capture.FormatReport() + L"\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -72,6 +82,11 @@ void SetStatus(ControlState& state, std::wstring const& text)
     {
         SetWindowTextW(state.status, text.c_str());
     }
+}
+
+void StopCapture(ControlState& state)
+{
+    state.capture.Stop();
 }
 
 void StopWatching(ControlState& state)
@@ -148,6 +163,7 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
         if (sampled.identity == tracing::platform::IdentityCheck::WindowDead ||
             sampled.identity == tracing::platform::IdentityCheck::HandleReused)
         {
+            StopCapture(state);
             StopWatching(state);
             state.selected.reset();
             std::wstring body = error;
@@ -267,6 +283,7 @@ void RefreshCandidates(ControlState& state)
             observed.creationTime);
         if (check == tracing::platform::IdentityCheck::WindowDead)
         {
+            StopCapture(state);
             StopWatching(state);
             state.selected.reset();
             SetStatusWithOverlay(
@@ -277,6 +294,7 @@ void RefreshCandidates(ControlState& state)
         }
         if (check == tracing::platform::IdentityCheck::HandleReused)
         {
+            StopCapture(state);
             StopWatching(state);
             state.selected.reset();
             SetStatusWithOverlay(
@@ -329,6 +347,7 @@ void SelectFromUi(ControlState& state)
         return;
     }
 
+    StopCapture(state);
     StopWatching(state);
     state.selected = selection.identity;
     ++state.nextGeneration;
@@ -385,6 +404,63 @@ void OnAlignmentMode(ControlState& state)
         L"Interaction mode: alignment (overlay accepts input).");
 }
 
+void OnStartCapture(ControlState& state)
+{
+    if (state.control != nullptr)
+    {
+        PostMessageW(state.control, kMsgStartCapture, 0, 0);
+    }
+}
+
+void OnStopCapture(ControlState& state)
+{
+    if (state.control != nullptr)
+    {
+        PostMessageW(state.control, kMsgStopCapture, 0, 0);
+    }
+}
+
+void StartCaptureNow(ControlState& state)
+{
+    if (!state.selected.has_value())
+    {
+        SetStatusWithOverlay(state, L"Select a PAINT HWND before Start Capture.");
+        return;
+    }
+    if (!state.device.IsReady())
+    {
+        SetStatusWithOverlay(state, L"Start Capture requires a ready D3D11 device.");
+        return;
+    }
+    if (state.lastGeometry.identity != tracing::platform::IdentityCheck::Match)
+    {
+        RefreshGeometryDisplay(state, L"");
+    }
+    if (!state.selected.has_value())
+    {
+        SetStatusWithOverlay(state, L"Target became invalid before Start Capture.");
+        return;
+    }
+
+    std::wstring error;
+    if (!state.capture.Start(
+            state.selected->hwnd,
+            state.selected->sessionGeneration,
+            state.lastGeometry.geometryGeneration,
+            state.device,
+            state.control,
+            kMsgCapture,
+            error))
+    {
+        SetStatusWithOverlay(state, error);
+        return;
+    }
+    RefreshGeometryDisplay(
+        state,
+        L"WGC capture started (frame counters/metadata only; not a preview). Overlay test-pattern "
+        L"is not a captured frame.");
+}
+
 std::wstring FormatMonitorDevice(POINT origin)
 {
     HMONITOR const monitor = MonitorFromPoint(origin, MONITOR_DEFAULTTONEAREST);
@@ -432,6 +508,7 @@ void OnCoverInputProbe(ControlState& state)
         return;
     }
 
+    StopCapture(state);
     StopWatching(state);
     state.selected.reset();
     state.overlay.ClearEmergencyHide();
@@ -585,6 +662,32 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdCoverProbe)),
             instance,
             nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Start Capture",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            466,
+            252,
+            104,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStartCapture)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Stop Capture",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            576,
+            252,
+            104,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStopCapture)),
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -643,6 +746,16 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 OnCoverInputProbe(*state);
                 return 0;
             }
+            if (id == kIdStartCapture && code == BN_CLICKED)
+            {
+                OnStartCapture(*state);
+                return 0;
+            }
+            if (id == kIdStopCapture && code == BN_CLICKED)
+            {
+                OnStopCapture(*state);
+                return 0;
+            }
             if (id == kIdList && code == LBN_DBLCLK)
             {
                 SelectFromUi(*state);
@@ -654,6 +767,35 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (state != nullptr && state->selected.has_value())
         {
             RefreshGeometryDisplay(*state, L"WinEvent");
+            return 0;
+        }
+        break;
+    case kMsgCapture:
+        if (state != nullptr)
+        {
+            if (wParam == 1)
+            {
+                state->capture.OnItemClosed();
+                RefreshGeometryDisplay(*state, L"WGC item Closed; session torn down.");
+                return 0;
+            }
+            state->capture.PumpHandoff();
+            RefreshGeometryDisplay(*state, L"");
+            return 0;
+        }
+        break;
+    case kMsgStartCapture:
+        if (state != nullptr)
+        {
+            StartCaptureNow(*state);
+            return 0;
+        }
+        break;
+    case kMsgStopCapture:
+        if (state != nullptr)
+        {
+            StopCapture(*state);
+            SetStatusWithOverlay(*state, L"WGC capture stopped.");
             return 0;
         }
         break;
@@ -673,6 +815,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     case WM_DESTROY:
         if (state != nullptr)
         {
+            StopCapture(*state);
             StopWatching(*state);
             state->overlay.Release();
             state->device.Release();
@@ -695,6 +838,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     {
         return 1;
     }
+
+    winrt::init_apartment(winrt::apartment_type::single_threaded);
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
