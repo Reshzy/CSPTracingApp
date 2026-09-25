@@ -1,12 +1,12 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Prompt 07-fallback replaced that path with an isolated WS_EX_LAYERED UpdateLayeredWindow presenter; InputProbe click/wheel pass-through now PASSes on both monitors, and tracing hits the titled CSP HWND without overlay activation. Prompt 08 added a C++/WinRT WGC session with a free-threaded frame pool, owned-frame handoff, and control-window counters/metadata. Prompt 09 added an opt-in ordinary WDA_NONE capture preview, frame-pool Recreate on content-size change, measured capture-to-client mapping, and overlay hide on capture loss. Prompt 10 added Unicode IFileOpenDialog plus WIC PNG/JPEG decode into an owned 32bppPBGRA buffer with 16,384/axis and 256-MiB limits. Prompt 11 uploads that buffer once to an immutable D3D11 texture, compiles shaders/Image.hlsl with discovered SDK fxc, and draws a premultiplied textured quad onto the existing layered overlay HWND with opacity/fit/reset. Prompt 12 adds a separate ordinary `WDA_NONE` ReferenceWindow with its own DXGI swap chain that reuses that immutable texture; overlay exclusion stays `WDA_EXCLUDEFROMCAPTURE`. Prompt 13 added labelled temporary OBS diagnostics (WDA_NONE positive-control latch, skip overlay image present, Recreate overlay HWND) and ran local OBS Display Capture recordings. Saved playback showed the ordinary green ReferenceWindow and intact CSP, but never the magenta `UpdateLayeredWindow` overlay, including while affinity readback was `WDA_NONE`. The 13-present repair replaced ULW with `CreateSwapChainForHwnd` (`presentPath=dxgi-hwnd`, no `WS_EX_NOREDIRECTIONBITMAP`, no DirectComposition). Premultiplied alpha swap-chain create failed `DXGI_ERROR_INVALID_CALL` (`0x887A0001`); ignore-alpha plus `DwmExtendFrameIntoClientArea` succeeded. CAPTUREBLT/PrintWindow and saved Automatic Display Capture now show the magenta/yellow L. WDA_NONE positive control PASSed and restored `WDA_EXCLUDEFROMCAPTURE` omitted the overlay with no black hole on Automatic. DXGI Desktop Duplication and Windows 10 (1903+) methods were not re-recorded this repair. Overlay clear is opaque black (ALPHA_IGNORE). Pen/pressure remains NOT RUN. Prompt 14 added a Windows-free double-precision Transform2D engine (column-vector, X-right/Y-down, spaces R/D/S/O/C) with GoogleTest coverage and a canned control-window diagnostic; actual pO=(2040,102) matched the hand-computed expected point. Image placement remains explicit ImagePlacement; tracking is not connected.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Prompt 07-fallback replaced that path with an isolated WS_EX_LAYERED UpdateLayeredWindow presenter; InputProbe click/wheel pass-through now PASSes on both monitors, and tracing hits the titled CSP HWND without overlay activation. Prompt 08 added a C++/WinRT WGC session with a free-threaded frame pool, owned-frame handoff, and control-window counters/metadata. Prompt 09 added an opt-in ordinary WDA_NONE capture preview, frame-pool Recreate on content-size change, measured capture-to-client mapping, and overlay hide on capture loss. Prompt 10 added Unicode IFileOpenDialog plus WIC PNG/JPEG decode into an owned 32bppPBGRA buffer with 16,384/axis and 256-MiB limits. Prompt 11 uploads that buffer once to an immutable D3D11 texture, compiles shaders/Image.hlsl with discovered SDK fxc, and draws a premultiplied textured quad onto the existing layered overlay HWND with opacity/fit/reset. Prompt 12 adds a separate ordinary `WDA_NONE` ReferenceWindow with its own DXGI swap chain that reuses that immutable texture; overlay exclusion stays `WDA_EXCLUDEFROMCAPTURE`. Prompt 13 added labelled temporary OBS diagnostics (WDA_NONE positive-control latch, skip overlay image present, Recreate overlay HWND) and ran local OBS Display Capture recordings. Saved playback showed the ordinary green ReferenceWindow and intact CSP, but never the magenta `UpdateLayeredWindow` overlay, including while affinity readback was `WDA_NONE`. The 13-present repair replaced ULW with `CreateSwapChainForHwnd` (`presentPath=dxgi-hwnd`, no `WS_EX_NOREDIRECTIONBITMAP`, no DirectComposition). Premultiplied alpha swap-chain create failed `DXGI_ERROR_INVALID_CALL` (`0x887A0001`); ignore-alpha plus `DwmExtendFrameIntoClientArea` succeeded. CAPTUREBLT/PrintWindow and saved Automatic Display Capture now show the magenta/yellow L. WDA_NONE positive control PASSed and restored `WDA_EXCLUDEFROMCAPTURE` omitted the overlay with no black hole on Automatic. DXGI Desktop Duplication and Windows 10 (1903+) methods were not re-recorded this repair. Overlay clear is opaque black (ALPHA_IGNORE). Pen/pressure remains NOT RUN. Prompt 14 added a Windows-free double-precision Transform2D engine (column-vector, X-right/Y-down, spaces R/D/S/O/C) with GoogleTest coverage and a canned control-window diagnostic; actual pO=(2040,102) matched the hand-computed expected point. Prompt 15 substep A added a Windows-free Calibration engine (ROI validation, M_CS, M_RD vs M_DS, overlay-local clip, invalidation, local vs declared-document unit labels) with GoogleTest coverage, control-window ROI/align/canvas controls, and overlay HWND clipped to the applied canvas ROI. Axis-aligned pan/zoom derives ImagePlacement from M_RO; rotation/flip stay numerical until a later ImageRenderer affine substep. Automatic tracking remains disabled. Real CSP landmark/move checks were NOT RUN (CLIPStudioPaint not running).
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: HEAD `9fc0b60` (`feature/init`; Prompt 14 Transform2D files uncommitted); Win32 control window plus WS_EX_LAYERED overlay HWND presented with `CreateSwapChainForHwnd` (`presentPath=dxgi-hwnd`, default WDA_EXCLUDEFROMCAPTURE; temporary WDA_NONE positive-control latch; `SetLayeredWindowAttributes(LWA_ALPHA)`; no `WS_EX_NOREDIRECTIONBITMAP`; no ULW; no DirectComposition) and a separate ordinary WS_OVERLAPPEDWINDOW ReferenceWindow (WDA_NONE, DXGI swap chain); skip-image-present diagnostic keeps the magenta/yellow test marker on the overlay swap-chain RTV; ImageRenderer draws into that same RTV; shaders compiled with discovered `fxc.exe` `10.0.26100.8249` at `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe`; capture preview stayed off for recordings; Debug `out/build/windows-debug/Debug/TracingApp.exe` (2284032 bytes, 2026-09-25 22:03:29), `TracingApp.TransformTests.exe` (925696 bytes, 2026-09-25 22:03:00) and `TracingApp.InputProbe.exe` (70144 bytes, 2026-09-25 18:02:00); Release not rebuilt this step
+- App commit/build and renderer path: HEAD `2c3e24f` (`feature/init`; Prompt 15 Calibration files uncommitted); Win32 control window plus WS_EX_LAYERED overlay HWND presented with `CreateSwapChainForHwnd` (`presentPath=dxgi-hwnd`, default WDA_EXCLUDEFROMCAPTURE; temporary WDA_NONE positive-control latch; `SetLayeredWindowAttributes(LWA_ALPHA)`; no `WS_EX_NOREDIRECTIONBITMAP`; no ULW; no DirectComposition) and a separate ordinary WS_OVERLAPPEDWINDOW ReferenceWindow (WDA_NONE, DXGI swap chain); skip-image-present diagnostic keeps the magenta/yellow test marker on the overlay swap-chain RTV; ImageRenderer draws into that same RTV; shaders compiled with discovered `fxc.exe` `10.0.26100.8249` at `C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe`; capture preview stayed off for recordings; Debug `out/build/windows-debug/Debug/TracingApp.exe` (2323456 bytes, 2026-09-25 22:33:14), `TracingApp.CalibrationTests.exe` (982016 bytes, 2026-09-25 22:33:18), `TracingApp.TransformTests.exe` and `TracingApp.InputProbe.exe`; Release not rebuilt this step
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). dxdiag 2026-09-25: both NVIDIA outputs HDR Support=Supported and AdvancedColorSupported, but Display Color Space=`DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709` (SDR gamma 2.2, not HDR active). OBS profile ColorSpace=709, ColorFormat=NV12, SdrWhiteLevel=300.
 - Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
 - OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
@@ -22,7 +22,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 - M2 transparency/input/affinity: PASS for mouse/wheel pass-through on DISPLAY1/R27qe after 13-present (dxgi-hwnd). Prompt 05 device PASS; Prompt 06 affinity/emergency hide/visibility policy PASS; Prompt 07 DComp path FAIL (superseded). Prompt 07-fallback ULW pass-through on both monitors remains historical PASS. 13-present keeps `WS_EX_LAYERED` + tracing `WS_EX_TRANSPARENT` without `NOREDIRECTIONBITMAP`; DISPLAY1 InputProbe click/wheel PASS without overlay activation; DISPLAY2 click landed on `MozillaDialogClass` (setup overlap, overlay did not activate); alignment intercepts overlay HWND; emergency hide PASS. Visual clear is opaque black (`DXGI_ALPHA_MODE_IGNORE`). Pen/pressure NOT RUN. Titled CSP HWND hit-test not re-run this repair.
 - M3 actual CSP capture/resize/no-feedback: PASS for titled CLIP STUDIO PAINT WGC preview + pool Recreate + marker-absent-from-capture-texture (Prompt 09). Prompt 08 counters/content-size remain PASS. Item-closed (CSP close while capturing) NOT RUN.
 - M4 imported image/ordinary reference/OBS playback: PASS for OBS Display Capture **Automatic** on the dxgi-hwnd overlay (13-present). WIC/import/renderer/ReferenceWindow remain PASS (Prompts 10–12). WDA_NONE saved playback contains the magenta/yellow L (2016 magenta / 1378 yellow samples in a 1920x1080 still). Restored exclude playback omits the marker with InputProbe/CSP chrome intact and no black overlay hole. DXGI Desktop Duplication and Windows 10 (1903+) methods NOT RUN this repair (ULW-era FAIL records remain). Ordinary green ReferenceWindow was not shown in the 13-present clips (Prompt 12/13 PASS still stands). Opaque black overlay body is a remaining tracing-transparency defect, not an exclusion failure.
-- M5 manual transforms/calibration: NOT RUN (Prompt 14 numerical engine and canned diagnostic PASS; no visual landmark alignment, viewport clipping, or M_RD wired to ImageRenderer)
+- M5 manual transforms/calibration: PARTIAL (Prompt 14 numerical engine PASS; Prompt 15a ROI/mapping/invalidation tests PASS and control-window calibration UI PASS; overlay HWND clips to applied ROI; CSP visual landmarks, mixed-DPI move, and ImageRenderer rotation/flip remain NOT RUN)
 - M6 visual/parity tracking and confidence safety: NOT RUN
 - M7 hybrid observers/fusion: NOT RUN
 - M8 integration/performance/final recording regression: NOT RUN
@@ -32,7 +32,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 - [ ] Actual CSP painting window selected; ambiguous instances require selection.
 - [ ] Physical coordinates correct at 100%, 125%, 150%, 200% scale where available.
 - [ ] Negative-origin and mixed-DPI monitor movement tested or explicitly not available.
-- [ ] Overlay transparent outside image and clipped to selected canvas. (13-present: ALPHA_IGNORE DXGI HWND is opaque black outside the marker; CAPTUREBLT and OBS positive-control stills show a black rectangle plus magenta/yellow L)
+- [ ] Overlay transparent outside image and clipped to selected canvas. (15a: overlay HWND is positioned to the applied client-relative ROI so chrome is not covered; ALPHA_IGNORE body is still opaque black inside that HWND. CSP Apply-ROI visual check NOT RUN this step)
 - [ ] Mouse, wheel and pen/pressure reach CSP; overlay does not take focus. (13-present: DISPLAY1 InputProbe click/wheel PASS, overlay not foreground; DISPLAY2 click hit MozillaDialogClass; CSP titled-HWND and pen NOT RUN)
 - [x] Interactive alignment toggles back to tracing without stuck input. (13-present: WindowFromPoint returns TracingAppOverlayWindow in alignment on DISPLAY1 and DISPLAY2)
 - [x] Emergency hide works; minimize/target close/unrelated focus hide appropriately. (13-present: Emergency Hide hides overlay HWND. Minimize/target-close/unrelated-focus not re-run this repair)
@@ -46,7 +46,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 - [x] Ordinary reference visible in playback throughout its visible intervals. (green TracingApp Reference on R27qe Display Capture; Prompt 13, not re-shown in 13-present clips)
 - [x] No private-frame flash/black rectangle during show/hide/resize/recreation. (Prompt 13 exclude t38/t50; 13-present exclude crop shows InputProbe not a black hole. Recreate/opacity/resize NOT RUN this repair)
 - [ ] Each intended OBS method and monitor configuration tested separately. (13-present Automatic PASS on R27qe 2560x1440; DXGI Desktop Duplication and Windows 10 (1903+) NOT RUN after the presenter change; mixed-DPI/negative-origin still unavailable)
-- [ ] Manual pan/zoom/rotation/flips obey known asymmetric landmarks. (Prompt 14 canned numerical pO=(2040,102) PASS; visual CSP landmarks remain Prompt 15)
+- [ ] Manual pan/zoom/rotation/flips obey known asymmetric landmarks. (Prompt 14 canned pO=(2040,102) PASS; Prompt 15a GoogleTest conversions/clip/invalidation PASS; control smoke Apply ROI without target and Transform diag PASS; CSP pan/zoom/rotation/flip landmarks NOT RUN — CLIPStudioPaint not running; visual rotation/flip needs Prompt 15 substep B)
 - [ ] Visual tracking tested with textured drawing and new strokes.
 - [ ] Blank/symmetric scenes and ambiguous flips degrade/hide safely.
 - [ ] Navigator disappearance and optional observer disablement handled.
@@ -1269,6 +1269,59 @@ Manual checklist remaining:
   1. Prompt 15 — manual calibration, viewport clipping, and visual landmark alignment.
   2. Optional later: DXGI DDA and Windows 10 (1903+) OBS methods; per-pixel overlay transparency.
 Blocker or next prompt: 15 — Manual calibration and viewport clipping
+```
+
+```text
+Step / milestone: 15a / M5 manual calibration engine + ROI HWND clip (not visual rotation/flip)
+Date / commit: 2026-09-25 / working tree on feature/init ahead of 2c3e24f (uncommitted)
+Status: PASS for Debug configure/build/test and control-window calibration smoke. CSP landmark/move/mixed-DPI NOT RUN. ImageRenderer affine rotation/flip remains substep B. M5 overall PARTIAL.
+Changed files:
+  src/core/Calibration.h (new)
+  src/core/Calibration.cpp (new)
+  tests/unit/CalibrationTests.cpp (new)
+  CMakeLists.txt
+  src/app/main.cpp
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  cmake --preset windows-debug
+  exit 0
+  TracingApp fxc: C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/fxc.exe
+  reused gtest:x64-windows@1.17.0#3; SDK 10.0.26100.0; CXX MSVC 19.51.36260.0; binaryDir out/build/windows-debug
+Build command + exit code:
+  cmake --build --preset windows-debug
+  exit 0
+  MSBuild 18.10.1-1.26427.6+3cd27c13e
+  TracingApp.exe 2323456 bytes (2026-09-25 22:33:14)
+  TracingApp.CalibrationTests.exe 982016 bytes (2026-09-25 22:33:18)
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 9, passed 9, failed 0 (new TracingApp.CalibrationTests)
+  TracingApp.CalibrationTests --gtest_list_tests: 15 cases (ROI accept/reject, capture-to-screen with negative origin, unmatched mapping, local vs declared document units, window-move M_RD stability, size/generation invalidation, mapping-required reject, landmark clip after origin change, axis-aligned placement vs rotation reject, fit contain, report labels)
+Manual setup and exact actions:
+  Get-CimInstance Win32_Process filtered clipstudio|CLIPStudio: no matching processes
+  Start-Process out/build/windows-debug/Debug/TracingApp.exe (PID 15464, class TracingAppControlWindow). Read STATIC id 1004. SendMessage BM_CLICK Apply ROI id 1026. BM_CLICK Transform diag id 1021. CloseMainWindow; WaitForExit.
+Expected / actual:
+  expected: status contains tracking=disabled and local calibrated units; Apply ROI without a target refuses; canned diag still maps pO=(2040,102); clean exit
+  actual: before click status included tracking=disabled, roiApplied=no, units=local calibrated units (not verified document pixels or CSP zoom %), M_RD/M_DS listed separately; after Apply ROI: "Apply ROI: select a PAINT HWND first."; after Transform diag: actual pO=(2040,102) inverse round-trip 0.000e+00; CloseMainWindow ExitCode=0 leftover=0
+Evidence paths (local, no private artwork committed; out/ is gitignored):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/build/windows-debug/Debug/TracingApp.CalibrationTests.exe
+  out/manual/prompt15-control-smoke.txt
+Measured samples / p50 / p95 / max where applicable:
+  no CSP landmark registration samples (CLIPStudioPaint not running)
+Known limitations / unavailable hardware:
+  cmake/ctest not on PATH; invoked via VS 2026 bundled binaries
+  Release configure/build/test NOT RUN this step
+  CLIPStudioPaint not running; mixed-DPI and negative-origin monitors still absent
+  overlay HWND clip covers the ROI with opaque ALPHA_IGNORE black outside the image
+  rotation/flip stored in M_RD/M_DS but ImagePlacement is translation+uniform scale only
+  automatic tracking remains disabled
+Manual checklist remaining:
+  1. Prompt 15 substep B — ImageRenderer affine (rotation/flip) plus RS scissor; CSP landmark pan/zoom/rotation/flip and same-DPI window move.
+  2. Optional later: DXGI DDA and Windows 10 (1903+) OBS methods; per-pixel overlay transparency.
+Blocker or next prompt: 15b — ImageRenderer affine placement and CSP visual calibration, then 16
 ```
 
 ## Final acceptance

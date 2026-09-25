@@ -33,6 +33,7 @@ add_executable(TracingApp WIN32
     src/capture/CaptureSession.cpp
     src/image/ImageLoader.cpp
     src/core/Transform2D.cpp
+    src/core/Calibration.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
 target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid gdi32 comctl32 WindowsApp windowscodecs ole32 uuid shell32)
@@ -161,6 +162,13 @@ add_executable(TracingApp.TransformTests
 tracing_app_apply_first_party_options(TracingApp.TransformTests)
 target_link_libraries(TracingApp.TransformTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.CalibrationTests
+    tests/unit/CalibrationTests.cpp
+    src/core/Calibration.cpp
+    src/core/Transform2D.cpp)
+tracing_app_apply_first_party_options(TracingApp.CalibrationTests)
+target_link_libraries(TracingApp.CalibrationTests PRIVATE GTest::gtest_main)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -174,4 +182,5 @@ add_test(NAME TracingApp.OverlayPolicyTests COMMAND TracingApp.OverlayPolicyTest
 add_test(NAME TracingApp.CaptureStateTests COMMAND TracingApp.CaptureStateTests)
 add_test(NAME TracingApp.ImageLoaderTests COMMAND TracingApp.ImageLoaderTests)
 add_test(NAME TracingApp.TransformTests COMMAND TracingApp.TransformTests)
+add_test(NAME TracingApp.CalibrationTests COMMAND TracingApp.CalibrationTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)

@@ -5,8 +5,11 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <numbers>
 #include <optional>
 #include <string>
 #include <vector>
@@ -29,6 +32,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "graphics/DeviceResources.h"
 #include "graphics/ImageRenderer.h"
 #include "graphics/OverlaySurface.h"
+#include "core/Calibration.h"
 #include "core/Transform2D.h"
 #include "image/ImageLoader.h"
 #include "platform/TargetDiscovery.h"
@@ -37,7 +41,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 
 namespace {
 constexpr int kDefaultWidth = 720;
-constexpr int kDefaultHeight = 840;
+constexpr int kDefaultHeight = 980;
 constexpr wchar_t kWindowClass[] = L"TracingAppControlWindow";
 constexpr wchar_t kWindowTitle[] = L"TracingApp";
 constexpr int kIdList = 1001;
@@ -61,12 +65,65 @@ constexpr int kIdObsPositiveControl = 1018;
 constexpr int kIdObsSkipOverlayImage = 1019;
 constexpr int kIdRecreateOverlay = 1020;
 constexpr int kIdTransformDiag = 1021;
+constexpr int kIdRoiX = 1022;
+constexpr int kIdRoiY = 1023;
+constexpr int kIdRoiW = 1024;
+constexpr int kIdRoiH = 1025;
+constexpr int kIdApplyRoi = 1026;
+constexpr int kIdDocW = 1027;
+constexpr int kIdDocH = 1028;
+constexpr int kIdAlignN = 1029;
+constexpr int kIdAlignS = 1030;
+constexpr int kIdAlignW = 1031;
+constexpr int kIdAlignE = 1032;
+constexpr int kIdAlignScaleDown = 1033;
+constexpr int kIdAlignScaleUp = 1034;
+constexpr int kIdAlignRotLeft = 1035;
+constexpr int kIdAlignRotRight = 1036;
+constexpr int kIdAlignFlipX = 1037;
+constexpr int kIdAlignFlipY = 1038;
+constexpr int kIdCanvasN = 1039;
+constexpr int kIdCanvasS = 1040;
+constexpr int kIdCanvasW = 1041;
+constexpr int kIdCanvasE = 1042;
+constexpr int kIdCanvasZoomDown = 1043;
+constexpr int kIdCanvasZoomUp = 1044;
+constexpr int kIdCanvasRotLeft = 1045;
+constexpr int kIdCanvasRotRight = 1046;
+constexpr int kIdCanvasFlipX = 1047;
+constexpr int kIdCanvasFlipY = 1048;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
 constexpr UINT kMsgStopCapture = WM_APP + 4;
 constexpr UINT_PTR kTimerGeometry = 1;
 constexpr UINT kGeometryPollMs = 250;
+constexpr double kAlignNudgePx = 8.0;
+constexpr double kCanvasNudgePx = 16.0;
+constexpr double kScaleStep = 1.05;
+constexpr double kRotateStepRadians = 15.0 * std::numbers::pi_v<double> / 180.0;
+constexpr double kMinZoom = 1.0e-6;
+constexpr double kMaxZoom = 1.0e6;
+
+struct LiveCalibration
+{
+    bool roiApplied = false;
+    tracing::core::Rect2 roi{};
+    std::uint64_t targetGeneration = 0;
+    double clientWidth = 0.0;
+    double clientHeight = 0.0;
+    double declaredDocW = 0.0;
+    double declaredDocH = 0.0;
+    tracing::core::ReferenceAlignment mRd{};
+    tracing::core::Vec2 documentAnchor{};
+    double zoom = 1.0;
+    double canvasRadians = 0.0;
+    bool canvasFlipX = false;
+    bool canvasFlipY = false;
+    tracing::core::CalibrationInvalidation lastInvalidation =
+        tracing::core::CalibrationInvalidation::None;
+    bool axisAlignedPlacement = true;
+};
 
 struct ControlState
 {
@@ -88,6 +145,13 @@ struct ControlState
     HWND opacityTrack = nullptr;
     HWND obsPositiveControlCheck = nullptr;
     HWND obsSkipOverlayImageCheck = nullptr;
+    HWND roiXEdit = nullptr;
+    HWND roiYEdit = nullptr;
+    HWND roiWEdit = nullptr;
+    HWND roiHEdit = nullptr;
+    HWND docWEdit = nullptr;
+    HWND docHEdit = nullptr;
+    LiveCalibration calibration;
     bool hideOverlayOnCaptureLoss = false;
     bool obsSkipOverlayImagePresent = false;
     std::uint64_t nextGeneration = 1;
@@ -121,6 +185,191 @@ tracing::graphics::CaptureToClientMapping MappingFromState(ControlState const& s
         dwm.y,
         dwm.width,
         dwm.height);
+}
+
+std::wstring WidenAscii(std::string const& ascii)
+{
+    return std::wstring(ascii.begin(), ascii.end());
+}
+
+tracing::core::CaptureMappingMatch CoreMappingMatch(
+    tracing::graphics::CaptureSizeMatch match) noexcept
+{
+    switch (match)
+    {
+    case tracing::graphics::CaptureSizeMatch::OuterWindow:
+        return tracing::core::CaptureMappingMatch::OuterWindow;
+    case tracing::graphics::CaptureSizeMatch::DwmFrame:
+        return tracing::core::CaptureMappingMatch::DwmFrame;
+    case tracing::graphics::CaptureSizeMatch::OuterAndDwm:
+        return tracing::core::CaptureMappingMatch::OuterAndDwm;
+    default:
+        return tracing::core::CaptureMappingMatch::None;
+    }
+}
+
+tracing::core::CaptureMappingInput CoreMappingFromState(ControlState const& state)
+{
+    tracing::graphics::CaptureToClientMapping const mapping = MappingFromState(state);
+    tracing::core::CaptureMappingInput input{};
+    input.contentWidth = static_cast<double>(mapping.contentWidth);
+    input.contentHeight = static_cast<double>(mapping.contentHeight);
+    input.clientOriginS = tracing::core::Vec2{
+        static_cast<double>(mapping.clientX),
+        static_cast<double>(mapping.clientY)};
+    input.clientWidth = static_cast<double>(mapping.clientWidth);
+    input.clientHeight = static_cast<double>(mapping.clientHeight);
+    input.captureToClient = tracing::core::Vec2{
+        static_cast<double>(mapping.captureToClientX),
+        static_cast<double>(mapping.captureToClientY)};
+    input.match = CoreMappingMatch(mapping.sizeMatch);
+    return input;
+}
+
+void ResetLiveCalibration(ControlState& state)
+{
+    state.calibration = LiveCalibration{};
+    state.calibration.mRd = tracing::core::ResetReferenceAlignment();
+    state.calibration.zoom = 1.0;
+}
+
+bool CalibrationIsLive(ControlState const& state) noexcept
+{
+    return state.calibration.roiApplied &&
+           state.calibration.lastInvalidation == tracing::core::CalibrationInvalidation::None;
+}
+
+bool ReadEditDouble(HWND edit, double& value, bool allowEmpty, double emptyValue)
+{
+    value = emptyValue;
+    if (edit == nullptr)
+    {
+        return allowEmpty;
+    }
+    wchar_t buffer[64]{};
+    GetWindowTextW(edit, buffer, 64);
+    if (buffer[0] == L'\0')
+    {
+        return allowEmpty;
+    }
+    wchar_t* end = nullptr;
+    double const parsed = wcstod(buffer, &end);
+    if (end == buffer || !std::isfinite(parsed))
+    {
+        return false;
+    }
+    value = parsed;
+    return true;
+}
+
+tracing::core::Vec2 ClientOriginFromGeometry(tracing::platform::GeometrySnapshot const& geometry)
+{
+    return tracing::core::Vec2{
+        static_cast<double>(geometry.clientPhysical.x),
+        static_cast<double>(geometry.clientPhysical.y)};
+}
+
+void ApplyDerivedImagePlacement(ControlState& state)
+{
+    if (!state.renderer.HasTexture() || !CalibrationIsLive(state))
+    {
+        return;
+    }
+
+    tracing::core::Vec2 const clientOrigin = ClientOriginFromGeometry(state.lastGeometry);
+    tracing::core::Vec2 const overlayOrigin =
+        tracing::core::RoiScreenOrigin(clientOrigin, state.calibration.roi);
+    tracing::core::Transform2D const mRd =
+        tracing::core::MakeAlignedReferenceToDocument(state.calibration.mRd);
+    tracing::core::Transform2D const mDs = tracing::core::MakeDocumentToScreen(
+        overlayOrigin,
+        state.calibration.canvasRadians,
+        state.calibration.zoom,
+        state.calibration.canvasFlipX,
+        state.calibration.canvasFlipY,
+        state.calibration.documentAnchor);
+    tracing::core::Transform2D const mSo = tracing::core::MakeScreenToOverlay(overlayOrigin);
+    std::optional<tracing::core::Transform2D> const mRs = tracing::core::Compose(mRd, mDs);
+    std::optional<tracing::core::Transform2D> const mRo =
+        mRs.has_value() ? tracing::core::Compose(*mRs, mSo) : std::nullopt;
+    if (!mRo.has_value())
+    {
+        state.calibration.axisAlignedPlacement = false;
+        return;
+    }
+
+    std::optional<tracing::core::AxisAlignedPlacement> const placement =
+        tracing::core::TryAxisAlignedOverlayPlacement(
+            *mRo,
+            static_cast<double>(state.renderer.TextureWidth()),
+            static_cast<double>(state.renderer.TextureHeight()));
+    if (!placement.has_value())
+    {
+        state.calibration.axisAlignedPlacement = false;
+        return;
+    }
+
+    tracing::graphics::ImagePlacement overlayPlacement{};
+    overlayPlacement.offsetX = placement->offsetX;
+    overlayPlacement.offsetY = placement->offsetY;
+    overlayPlacement.scale = placement->scale;
+    state.renderer.SetPlacement(overlayPlacement);
+    state.calibration.axisAlignedPlacement = true;
+}
+
+tracing::core::CalibrationReport MakeCalibrationReport(ControlState const& state)
+{
+    tracing::core::CalibrationReport report{};
+    report.roiApplied = state.calibration.roiApplied;
+    report.roi = state.calibration.roi;
+    tracing::core::Vec2 const clientOrigin = ClientOriginFromGeometry(state.lastGeometry);
+    tracing::core::Vec2 const overlayOrigin = CalibrationIsLive(state)
+        ? tracing::core::RoiScreenOrigin(clientOrigin, state.calibration.roi)
+        : clientOrigin;
+    report.clipO = tracing::core::OverlayClipO(
+        state.calibration.roi, clientOrigin, overlayOrigin);
+    report.units = tracing::core::ClassifyDocumentScale(
+        state.calibration.declaredDocW, state.calibration.declaredDocH);
+    report.declaredDocW = state.calibration.declaredDocW;
+    report.declaredDocH = state.calibration.declaredDocH;
+    report.mRd = state.calibration.mRd;
+    report.documentAnchor = state.calibration.documentAnchor;
+    report.zoom = state.calibration.zoom;
+    report.canvasRadians = state.calibration.canvasRadians;
+    report.canvasFlipX = state.calibration.canvasFlipX;
+    report.canvasFlipY = state.calibration.canvasFlipY;
+    report.mappingValidated =
+        tracing::core::CaptureMappingIsValidated(CoreMappingFromState(state));
+    report.invalidation = state.calibration.lastInvalidation;
+    report.axisAlignedPlacement = state.calibration.axisAlignedPlacement;
+    return report;
+}
+
+void RefreshCalibrationValidity(ControlState& state)
+{
+    if (!state.calibration.roiApplied || !state.selected.has_value())
+    {
+        return;
+    }
+
+    tracing::core::CalibrationSnapshot snap{};
+    snap.targetGeneration = state.calibration.targetGeneration;
+    snap.clientWidth = state.calibration.clientWidth;
+    snap.clientHeight = state.calibration.clientHeight;
+    snap.roi = state.calibration.roi;
+    snap.mappingRequired = false;
+    tracing::core::CalibrationInvalidation const reason =
+        tracing::core::ShouldInvalidateCalibration(
+            snap,
+            state.selected->sessionGeneration,
+            static_cast<double>(state.lastGeometry.clientPhysical.width),
+            static_cast<double>(state.lastGeometry.clientPhysical.height),
+            true);
+    if (reason != tracing::core::CalibrationInvalidation::None)
+    {
+        state.calibration.roiApplied = false;
+        state.calibration.lastInvalidation = reason;
+    }
 }
 
 void SyncObsDiagnosticCheckboxes(ControlState& state);
@@ -179,7 +428,9 @@ std::wstring StatusHeader(ControlState const& state)
            L" obsSkipOverlayImagePresent=" +
            std::wstring(state.obsSkipOverlayImagePresent ? L"yes" : L"no") +
            L" (temporary OBS-gate diagnostic)\r\n"
-           L"Transform diag: canned pR=(10,5)->pO=(2040,102); numerical only (not tracking)\r\n";
+           L"Transform diag: canned pR=(10,5)->pO=(2040,102); numerical only (not tracking)\r\n" +
+           WidenAscii(tracing::core::FormatCalibrationReport(MakeCalibrationReport(state))) +
+           L"\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -241,10 +492,34 @@ void SyncOverlayFromState(ControlState& state)
         targetUsable = eligibility == tracing::platform::OverlayEligibility::Eligible ||
                        eligibility == tracing::platform::OverlayEligibility::NotForeground;
         targetForeground = geometry.targetForeground;
-        placement.x = geometry.clientPhysical.x;
-        placement.y = geometry.clientPhysical.y;
-        placement.width = geometry.clientPhysical.width;
-        placement.height = geometry.clientPhysical.height;
+        bool const imageReady =
+            state.renderer.HasTexture() && !state.obsSkipOverlayImagePresent;
+        if (CalibrationIsLive(state))
+        {
+            tracing::core::Vec2 const clientOrigin = ClientOriginFromGeometry(geometry);
+            tracing::core::Vec2 const overlayOrigin =
+                tracing::core::RoiScreenOrigin(clientOrigin, state.calibration.roi);
+            placement.x = static_cast<long>(std::llround(overlayOrigin.x));
+            placement.y = static_cast<long>(std::llround(overlayOrigin.y));
+            placement.width = static_cast<long>(std::llround(state.calibration.roi.width));
+            placement.height = static_cast<long>(std::llround(state.calibration.roi.height));
+            if (imageReady)
+            {
+                ApplyDerivedImagePlacement(state);
+            }
+        }
+        else if (!imageReady)
+        {
+            placement.x = geometry.clientPhysical.x;
+            placement.y = geometry.clientPhysical.y;
+            placement.width = geometry.clientPhysical.width;
+            placement.height = geometry.clientPhysical.height;
+        }
+        else
+        {
+            placement = {};
+            targetUsable = false;
+        }
         if (state.hideOverlayOnCaptureLoss)
         {
             targetUsable = false;
@@ -321,6 +596,7 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
             StopCapture(state);
             StopWatching(state);
             state.selected.reset();
+            ResetLiveCalibration(state);
             std::wstring body = error;
             if (!extra.empty())
             {
@@ -343,6 +619,7 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
     sampled.geometryGeneration =
         tracing::platform::NextGeometryGeneration(state.lastGeometry, sampled);
     state.lastGeometry = sampled;
+    RefreshCalibrationValidity(state);
     state.capture.NoteGeometryGeneration(sampled.geometryGeneration);
     std::wstring body = tracing::platform::FormatGeometryReport(sampled);
     if (!extra.empty())
@@ -442,6 +719,7 @@ void RefreshCandidates(ControlState& state)
             StopCapture(state);
             StopWatching(state);
             state.selected.reset();
+            ResetLiveCalibration(state);
             SetStatusWithOverlay(
                 state,
                 L"Previous target is gone. HWND is no longer valid; geometry invalidated. "
@@ -453,6 +731,7 @@ void RefreshCandidates(ControlState& state)
             StopCapture(state);
             StopWatching(state);
             state.selected.reset();
+            ResetLiveCalibration(state);
             SetStatusWithOverlay(
                 state,
                 L"Previous HWND was reused by another process. Target and geometry cleared so "
@@ -507,6 +786,7 @@ void SelectFromUi(ControlState& state)
     StopWatching(state);
     state.selected = selection.identity;
     ++state.nextGeneration;
+    ResetLiveCalibration(state);
 
     std::wstring hookError;
     bool const hooked = StartWatching(state, hookError);
@@ -680,14 +960,16 @@ void OnImportImage(ControlState& state)
             return;
         }
 
-        tracing::graphics::OverlayPlacement const overlay = state.overlay.LastPlacement();
-        if (overlay.width > 0 && overlay.height > 0)
+        if (CalibrationIsLive(state))
         {
-            state.renderer.SetPlacement(tracing::graphics::FitPlacement(
+            bool const declared = state.calibration.declaredDocW > 0.0 &&
+                                  state.calibration.declaredDocH > 0.0;
+            state.calibration.mRd = tracing::core::FitReferenceInFrame(
                 static_cast<double>(state.renderer.TextureWidth()),
                 static_cast<double>(state.renderer.TextureHeight()),
-                static_cast<double>(overlay.width),
-                static_cast<double>(overlay.height)));
+                declared ? state.calibration.declaredDocW : state.calibration.roi.width,
+                declared ? state.calibration.declaredDocH : state.calibration.roi.height);
+            ApplyDerivedImagePlacement(state);
         }
         else
         {
@@ -743,22 +1025,27 @@ void OnFitImage(ControlState& state)
         SetStatusWithOverlay(state, L"Fit: no uploaded image.");
         return;
     }
-    tracing::graphics::OverlayPlacement overlay = state.overlay.LastPlacement();
-    if (overlay.width <= 0 || overlay.height <= 0)
-    {
-        overlay.width = 240;
-        overlay.height = 160;
-    }
     unsigned const generation = state.renderer.TextureGeneration();
-    state.renderer.SetPlacement(tracing::graphics::FitPlacement(
+    if (!CalibrationIsLive(state))
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Fit: apply a canvas ROI first (client bounds are not canvas). textureGeneration=" +
+                std::to_wstring(generation) + L" (unchanged).");
+        return;
+    }
+    bool const declared =
+        state.calibration.declaredDocW > 0.0 && state.calibration.declaredDocH > 0.0;
+    state.calibration.mRd = tracing::core::FitReferenceInFrame(
         static_cast<double>(state.renderer.TextureWidth()),
         static_cast<double>(state.renderer.TextureHeight()),
-        static_cast<double>(overlay.width),
-        static_cast<double>(overlay.height)));
+        declared ? state.calibration.declaredDocW : state.calibration.roi.width,
+        declared ? state.calibration.declaredDocH : state.calibration.roi.height);
+    ApplyDerivedImagePlacement(state);
     SetStatusWithOverlay(
         state,
-        L"Fit: uniform contain in overlay. textureGeneration=" + std::to_wstring(generation) +
-            L" (unchanged).");
+        L"Fit: uniform contain in ROI/declared document frame (M_RD). textureGeneration=" +
+            std::to_wstring(generation) + L" (unchanged).");
 }
 
 void OnResetPlacement(ControlState& state)
@@ -769,11 +1056,19 @@ void OnResetPlacement(ControlState& state)
         return;
     }
     unsigned const generation = state.renderer.TextureGeneration();
-    state.renderer.SetPlacement(tracing::graphics::ResetPlacement());
+    state.calibration.mRd = tracing::core::ResetReferenceAlignment();
+    if (CalibrationIsLive(state))
+    {
+        ApplyDerivedImagePlacement(state);
+    }
+    else
+    {
+        state.renderer.SetPlacement(tracing::graphics::ResetPlacement());
+    }
     SetStatusWithOverlay(
         state,
-        L"Reset: offset (0,0) scale 1. textureGeneration=" + std::to_wstring(generation) +
-            L" (unchanged).");
+        L"Reset: M_RD identity (offset 0, scale 1, no rot/flip). textureGeneration=" +
+            std::to_wstring(generation) + L" (unchanged).");
 }
 
 void SyncObsDiagnosticCheckboxes(ControlState& state)
@@ -874,6 +1169,163 @@ void OnTransformDiag(ControlState& state)
 {
     std::string const ascii = tracing::core::FormatCannedTransformDiagnostic();
     SetStatus(state, std::wstring(ascii.begin(), ascii.end()));
+}
+
+void OnApplyRoi(ControlState& state)
+{
+    if (!state.selected.has_value())
+    {
+        SetStatusWithOverlay(state, L"Apply ROI: select a PAINT HWND first.");
+        return;
+    }
+    if (state.lastGeometry.clientPhysical.width <= 0 ||
+        state.lastGeometry.clientPhysical.height <= 0)
+    {
+        SetStatusWithOverlay(state, L"Apply ROI: target client geometry is not valid yet.");
+        return;
+    }
+
+    tracing::core::Rect2 roi{};
+    if (!ReadEditDouble(state.roiXEdit, roi.x, false, 0.0) ||
+        !ReadEditDouble(state.roiYEdit, roi.y, false, 0.0) ||
+        !ReadEditDouble(state.roiWEdit, roi.width, false, 0.0) ||
+        !ReadEditDouble(state.roiHEdit, roi.height, false, 0.0))
+    {
+        SetStatusWithOverlay(state, L"Apply ROI: enter numeric client-relative x y w h.");
+        return;
+    }
+
+    double declaredW = 0.0;
+    double declaredH = 0.0;
+    if (!ReadEditDouble(state.docWEdit, declaredW, true, 0.0) ||
+        !ReadEditDouble(state.docHEdit, declaredH, true, 0.0))
+    {
+        SetStatusWithOverlay(state, L"Apply ROI: document W/H must be empty or numeric.");
+        return;
+    }
+
+    tracing::core::RoiRejectReason reason = tracing::core::RoiRejectReason::Ok;
+    std::optional<tracing::core::Rect2> const valid = tracing::core::TryValidateCanvasRoi(
+        roi,
+        static_cast<double>(state.lastGeometry.clientPhysical.width),
+        static_cast<double>(state.lastGeometry.clientPhysical.height),
+        reason);
+    if (!valid.has_value())
+    {
+        SetStatusWithOverlay(
+            state,
+            std::wstring(L"Apply ROI rejected: ") +
+                WidenAscii(tracing::core::FormatRoiRejectReason(reason)) +
+                L" (ROI is client-relative; client bounds are not canvas).");
+        return;
+    }
+
+    state.calibration.roi = *valid;
+    state.calibration.roiApplied = true;
+    state.calibration.targetGeneration = state.selected->sessionGeneration;
+    state.calibration.clientWidth =
+        static_cast<double>(state.lastGeometry.clientPhysical.width);
+    state.calibration.clientHeight =
+        static_cast<double>(state.lastGeometry.clientPhysical.height);
+    state.calibration.declaredDocW = declaredW;
+    state.calibration.declaredDocH = declaredH;
+    state.calibration.lastInvalidation = tracing::core::CalibrationInvalidation::None;
+    ApplyDerivedImagePlacement(state);
+    SetStatusWithOverlay(
+        state,
+        L"Applied canvas ROI in client-relative pixels. Overlay HWND clipped to ROI. "
+        L"Window move updates M_SO only. tracking=disabled.");
+}
+
+bool HandleCalibrationCommand(ControlState& state, int id)
+{
+    auto clampZoom = [](double zoom)
+    {
+        if (zoom < kMinZoom)
+        {
+            return kMinZoom;
+        }
+        if (zoom > kMaxZoom)
+        {
+            return kMaxZoom;
+        }
+        return zoom;
+    };
+
+    switch (id)
+    {
+    case kIdApplyRoi:
+        OnApplyRoi(state);
+        return true;
+    case kIdAlignN:
+        state.calibration.mRd.offsetD.y -= kAlignNudgePx;
+        break;
+    case kIdAlignS:
+        state.calibration.mRd.offsetD.y += kAlignNudgePx;
+        break;
+    case kIdAlignW:
+        state.calibration.mRd.offsetD.x -= kAlignNudgePx;
+        break;
+    case kIdAlignE:
+        state.calibration.mRd.offsetD.x += kAlignNudgePx;
+        break;
+    case kIdAlignScaleDown:
+        state.calibration.mRd.scale = clampZoom(state.calibration.mRd.scale / kScaleStep);
+        break;
+    case kIdAlignScaleUp:
+        state.calibration.mRd.scale = clampZoom(state.calibration.mRd.scale * kScaleStep);
+        break;
+    case kIdAlignRotLeft:
+        state.calibration.mRd.radiansClockwise -= kRotateStepRadians;
+        break;
+    case kIdAlignRotRight:
+        state.calibration.mRd.radiansClockwise += kRotateStepRadians;
+        break;
+    case kIdAlignFlipX:
+        state.calibration.mRd.flipX = !state.calibration.mRd.flipX;
+        break;
+    case kIdAlignFlipY:
+        state.calibration.mRd.flipY = !state.calibration.mRd.flipY;
+        break;
+    case kIdCanvasN:
+        state.calibration.documentAnchor.y -= kCanvasNudgePx;
+        break;
+    case kIdCanvasS:
+        state.calibration.documentAnchor.y += kCanvasNudgePx;
+        break;
+    case kIdCanvasW:
+        state.calibration.documentAnchor.x -= kCanvasNudgePx;
+        break;
+    case kIdCanvasE:
+        state.calibration.documentAnchor.x += kCanvasNudgePx;
+        break;
+    case kIdCanvasZoomDown:
+        state.calibration.zoom = clampZoom(state.calibration.zoom / kScaleStep);
+        break;
+    case kIdCanvasZoomUp:
+        state.calibration.zoom = clampZoom(state.calibration.zoom * kScaleStep);
+        break;
+    case kIdCanvasRotLeft:
+        state.calibration.canvasRadians -= kRotateStepRadians;
+        break;
+    case kIdCanvasRotRight:
+        state.calibration.canvasRadians += kRotateStepRadians;
+        break;
+    case kIdCanvasFlipX:
+        state.calibration.canvasFlipX = !state.calibration.canvasFlipX;
+        break;
+    case kIdCanvasFlipY:
+        state.calibration.canvasFlipY = !state.calibration.canvasFlipY;
+        break;
+    default:
+        return false;
+    }
+
+    ApplyDerivedImagePlacement(state);
+    SetStatusWithOverlay(
+        state,
+        L"Manual calibration updated (M_RD alignment vs M_DS canvas; tracking=disabled).");
+    return true;
 }
 
 void OnShowReference(ControlState& state)
@@ -986,6 +1438,7 @@ void OnCoverInputProbe(ControlState& state)
     StopCapture(state);
     StopWatching(state);
     state.selected.reset();
+    ResetLiveCalibration(state);
     state.overlay.ClearEmergencyHide();
 
     tracing::graphics::OverlayPlacement placement{};
@@ -1039,9 +1492,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            408,
+            492,
             680,
-            348,
+            420,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -1313,6 +1766,130 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdTransformDiag)),
             instance,
             nullptr);
+        auto addButton = [&](wchar_t const* title, int x, int y, int w, int h, int id)
+        {
+            CreateWindowExW(
+                0,
+                L"BUTTON",
+                title,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                x,
+                y,
+                w,
+                h,
+                hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                instance,
+                nullptr);
+        };
+        auto addEdit = [&](int x, int y, int w, int id, wchar_t const* initial) -> HWND
+        {
+            return CreateWindowExW(
+                WS_EX_CLIENTEDGE,
+                L"EDIT",
+                initial,
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                x,
+                y,
+                w,
+                22,
+                hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+                instance,
+                nullptr);
+        };
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"ROI",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            12,
+            406,
+            28,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->roiXEdit = addEdit(42, 404, 58, kIdRoiX, L"80");
+        created->roiYEdit = addEdit(102, 404, 58, kIdRoiY, L"80");
+        created->roiWEdit = addEdit(162, 404, 58, kIdRoiW, L"640");
+        created->roiHEdit = addEdit(222, 404, 58, kIdRoiH, L"480");
+        addButton(L"Apply ROI", 286, 402, 90, 24, kIdApplyRoi);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"Doc px",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            384,
+            406,
+            48,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->docWEdit = addEdit(434, 404, 70, kIdDocW, L"");
+        created->docHEdit = addEdit(506, 404, 70, kIdDocH, L"");
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"M_RD",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            12,
+            436,
+            40,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        addButton(L"N", 54, 432, 28, 24, kIdAlignN);
+        addButton(L"S", 84, 432, 28, 24, kIdAlignS);
+        addButton(L"W", 114, 432, 28, 24, kIdAlignW);
+        addButton(L"E", 144, 432, 28, 24, kIdAlignE);
+        addButton(L"-", 178, 432, 28, 24, kIdAlignScaleDown);
+        addButton(L"+", 208, 432, 28, 24, kIdAlignScaleUp);
+        addButton(L"R-", 242, 432, 32, 24, kIdAlignRotLeft);
+        addButton(L"R+", 276, 432, 32, 24, kIdAlignRotRight);
+        addButton(L"FX", 314, 432, 32, 24, kIdAlignFlipX);
+        addButton(L"FY", 348, 432, 32, 24, kIdAlignFlipY);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"M_DS",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            12,
+            464,
+            40,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        addButton(L"N", 54, 460, 28, 24, kIdCanvasN);
+        addButton(L"S", 84, 460, 28, 24, kIdCanvasS);
+        addButton(L"W", 114, 460, 28, 24, kIdCanvasW);
+        addButton(L"E", 144, 460, 28, 24, kIdCanvasE);
+        addButton(L"-", 178, 460, 28, 24, kIdCanvasZoomDown);
+        addButton(L"+", 208, 460, 28, 24, kIdCanvasZoomUp);
+        addButton(L"R-", 242, 460, 32, 24, kIdCanvasRotLeft);
+        addButton(L"R+", 276, 460, 32, 24, kIdCanvasRotRight);
+        addButton(L"FX", 314, 460, 32, 24, kIdCanvasFlipX);
+        addButton(L"FY", 348, 460, 32, 24, kIdCanvasFlipY);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"blank Doc=local units; M_DS zoom is relative not CSP %; rot/flip numerical until substep B",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            388,
+            434,
+            300,
+            52,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -1448,6 +2025,10 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdTransformDiag && code == BN_CLICKED)
             {
                 OnTransformDiag(*state);
+                return 0;
+            }
+            if (code == BN_CLICKED && HandleCalibrationCommand(*state, id))
+            {
                 return 0;
             }
             if (id == kIdList && code == LBN_DBLCLK)
