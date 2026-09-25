@@ -3,6 +3,7 @@
 #endif
 
 #include "capture/CaptureSession.h"
+#include "capture/RoiReadback.h"
 
 #include <Unknwn.h>
 #include <windows.graphics.capture.interop.h>
@@ -121,6 +122,8 @@ struct CaptureSession::Impl
     int poolHeight = 0;
     std::uint64_t recreateCount = 0;
     HRESULT lastRecreateHr = S_OK;
+    RoiReadback roiReadback;
+    std::wstring roiReport{L"roi (none)"};
 
     void OnFrameArrived(wgc::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&);
     void OnClosed(wgc::GraphicsCaptureItem const&, winrt::Windows::Foundation::IInspectable const&);
@@ -218,6 +221,9 @@ void CaptureSession::Impl::TeardownResources() noexcept
     {
         CloseFrameQuiet(queued.frame);
     }
+
+    roiReadback.Release();
+    roiReport = L"roi (none)";
 
     ownedTexture.Reset();
     ownedWidth = 0;
@@ -709,6 +715,40 @@ void CaptureSession::PumpHandoff()
     std::wstring copyError;
     bool const copied = impl_->CopyOwned(latest, copyHr, copyError);
 
+    std::wstring roiError;
+    if (copied && impl_->ownedTexture)
+    {
+        graphics::DeviceResources* gpu = nullptr;
+        {
+            std::lock_guard<std::mutex> const lock(impl_->mutex);
+            gpu = impl_->device;
+        }
+        if (gpu != nullptr && gpu->IsReady() && gpu->Device() != nullptr &&
+            gpu->ImmediateContext() != nullptr)
+        {
+            RoiPixelRect requested{};
+            requested.w = static_cast<int>(impl_->ownedWidth);
+            requested.h = static_cast<int>(impl_->ownedHeight);
+            int const downsample = DefaultRoiDownsample(requested.w, requested.h);
+            RoiBufferMeta meta{};
+            meta.sequence = latest.packet.sequence;
+            meta.captureTicks = latest.packet.captureTicks;
+            meta.targetGeneration = latest.packet.targetGeneration;
+            meta.geometryGeneration = latest.packet.geometryGeneration;
+            meta.kind = RoiKind::Canvas;
+            impl_->roiReadback.SubmitCopy(
+                gpu->Device(),
+                gpu->ImmediateContext(),
+                impl_->ownedTexture.Get(),
+                RoiKind::Canvas,
+                requested,
+                downsample,
+                meta,
+                roiError);
+            impl_->roiReadback.TryComplete(gpu->ImmediateContext(), roiError);
+        }
+    }
+
     HRESULT recreateHr = S_OK;
     std::wstring recreateError;
     bool const recreated = impl_->RecreatePoolIfContentSizeChanged(
@@ -721,6 +761,7 @@ void CaptureSession::PumpHandoff()
         std::lock_guard<std::mutex> const lock(impl_->mutex);
         impl_->lastHr = copied ? recreateHr : copyHr;
         impl_->lastRecreateHr = recreateHr;
+        impl_->roiReport = impl_->roiReadback.FormatReport();
         if (copied)
         {
             impl_->lastPacket = latest.packet;
@@ -735,6 +776,7 @@ void CaptureSession::PumpHandoff()
     (void)recreated;
     (void)copyError;
     (void)recreateError;
+    (void)roiError;
 }
 
 CaptureSessionState CaptureSession::State() const noexcept
@@ -807,6 +849,7 @@ std::wstring CaptureSession::FormatReport() const
     int poolHeight = 0;
     std::uint64_t recreateCount = 0;
     HRESULT lastRecreateHr = S_OK;
+    std::wstring roiReport;
     {
         std::lock_guard<std::mutex> const lock(impl_->mutex);
         policySnapshot = impl_->policy;
@@ -822,6 +865,7 @@ std::wstring CaptureSession::FormatReport() const
         poolHeight = impl_->poolHeight;
         recreateCount = impl_->recreateCount;
         lastRecreateHr = impl_->lastRecreateHr;
+        roiReport = impl_->roiReport;
     }
 
     std::wstring supportText = L"unchecked";
@@ -846,8 +890,8 @@ std::wstring CaptureSession::FormatReport() const
            L" ownedFrame=" + (hasOwned ? L"yes" : L"no") + L" lastHr=" + FormatHresult(lastHr) +
            L"\r\n" + L"poolSize=" + std::to_wstring(poolWidth) + L"x" + std::to_wstring(poolHeight) +
            L" recreates=" + std::to_wstring(recreateCount) + L" recreateHr=" +
-           FormatHresult(lastRecreateHr) +
-           L" (WGC copies owned textures; overlay test-pattern is not a captured frame)";
+           FormatHresult(lastRecreateHr) + L"\r\n" + roiReport +
+           L" (WGC copies owned textures; ROI CPU buffer is a packed copy, not zero-copy)";
 }
 
 } // namespace tracing::capture

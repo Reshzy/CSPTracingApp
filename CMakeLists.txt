@@ -31,6 +31,7 @@ add_executable(TracingApp WIN32
     src/graphics/ImageRenderer.cpp
     src/app/ReferenceWindow.cpp
     src/capture/CaptureSession.cpp
+    src/capture/RoiReadback.cpp
     src/image/ImageLoader.cpp
     src/core/Transform2D.cpp
     src/core/Calibration.cpp
@@ -169,6 +170,11 @@ add_executable(TracingApp.CalibrationTests
 tracing_app_apply_first_party_options(TracingApp.CalibrationTests)
 target_link_libraries(TracingApp.CalibrationTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.RoiTests
+    tests/unit/RoiTests.cpp)
+tracing_app_apply_first_party_options(TracingApp.RoiTests)
+target_link_libraries(TracingApp.RoiTests PRIVATE GTest::gtest_main)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -183,4 +189,5 @@ add_test(NAME TracingApp.CaptureStateTests COMMAND TracingApp.CaptureStateTests)
 add_test(NAME TracingApp.ImageLoaderTests COMMAND TracingApp.ImageLoaderTests)
 add_test(NAME TracingApp.TransformTests COMMAND TracingApp.TransformTests)
 add_test(NAME TracingApp.CalibrationTests COMMAND TracingApp.CalibrationTests)
+add_test(NAME TracingApp.RoiTests COMMAND TracingApp.RoiTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)
