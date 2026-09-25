@@ -1,24 +1,24 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains NOT RUN. OBS recording and hardware acceptance testing remain NOT RUN.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains NOT RUN. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. OBS recording and hardware acceptance testing remain NOT RUN.
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: HEAD `bd02be3` (`feature/init`, Prompt 03 files uncommitted); Win32 control window with candidate list; Debug `out/build/windows-debug/Debug/TracingApp.exe` (829952 bytes, 2026-09-25 16:28:57); Release not rebuilt this step
+- App commit/build and renderer path: HEAD `2bb21dce` (`feature/init`, Prompt 04 files uncommitted); Win32 control window with candidate list, PerMonitorV2 manifest, and geometry status; Debug `out/build/windows-debug/Debug/TracingApp.exe` (859648 bytes, 2026-09-25 16:51:09); Release not rebuilt this step
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). SDR/HDR NOT RECORDED
 - Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
 - OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
 - C++/WinRT (verify-only, not linked): SDK `10.0.26100.0` headers present at `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\cppwinrt\winrt\base.h` and `windows.graphics.capture.h`; `cppwinrt.exe` v2.0.250303.5. Windows App SDK not adopted.
-- GPU, driver, monitor sizes/refresh/DPI/origins: NVIDIA GeForce RTX 3060 driver 32.0.16.1656 at 2560x1440 (active); AMD Radeon(TM) Graphics driver 32.0.21042.62 (no current resolution reported). Refresh/DPI/origins NOT RECORDED
+- GPU, driver, monitor sizes/refresh/DPI/origins: NVIDIA GeForce RTX 3060 driver 32.0.16.1656; AMD Radeon(TM) Graphics driver 32.0.21042.62. Screens: `\\.\DISPLAY2` primary Bounds={X=0,Y=0,Width=1920,Height=1080} effective DPI 96x96; `\\.\DISPLAY1` Bounds={X=1920,Y=0,Width=2560,Height=1440} effective DPI 96x96. Refresh NOT RECORDED. Negative-origin monitor not present (`MonitorFromPoint(-100,100)` resolved to the primary). Mixed-DPI not present (both 96).
 - CSP version/locale/theme/workspace and drawing device: NOT RECORDED
 - OBS version, Display Capture method/settings, recording resolution/FPS: NOT RECORDED
 
 ## Milestone status
 
-- M0 reproducible shell/build/tests: PASS (Prompts 01–02: local Git, Win32 control window, vcpkg baseline, first-party `/W4` `/permissive-`, GoogleTest, Debug+Release `--fresh` configure/build/test. DPI manifest remains Prompt 04)
-- M1 CSP discovery/geometry/lifecycle: NOT RUN (Prompt 03 automated filter/selection tests PASS; real CSP enumerate/select, geometry, and lifecycle remain later / unavailable this step)
+- M0 reproducible shell/build/tests: PASS (Prompts 01–02 plus Prompt 04 DPI manifest: local Git, Win32 control window, PerMonitorV2 RT_MANIFEST, vcpkg baseline, first-party `/W4` `/permissive-`, GoogleTest, Debug configure/build/test)
+- M1 CSP discovery/geometry/lifecycle: NOT RUN (Prompt 03 automated filter/selection tests PASS; Prompt 04 geometry/lifecycle code and control-window DPI smoke test PASS; real CSP enumerate/select, mixed-DPI move, minimize/restore/close remain unavailable this step)
 - M2 transparency/input/affinity: NOT RUN
 - M3 actual CSP capture/resize/no-feedback: NOT RUN
 - M4 imported image/ordinary reference/OBS playback: NOT RUN — mandatory before tracking
@@ -262,6 +262,69 @@ Manual checklist remaining for real CSP:
   5. Highlight one PAINT row and Select: status shows PID and generation.
   6. Close that document or replace the HWND and Refresh: expect target cleared, no silent reuse.
 Blocker or next prompt: 04 — Physical geometry and lifecycle
+```
+
+```text
+Step / milestone: 04 / M1 physical geometry and lifecycle
+Date / commit: 2026-09-25 / working tree on feature/init ahead of 2bb21dce (uncommitted)
+Status: PASS for Debug configure/build/test, embedded PerMonitorV2 manifest, and control-window DPI/geometry smoke; real CSP move/resize/minimize/close NOT RUN
+Changed files:
+  resources/app.manifest (new)
+  src/platform/TargetGeometry.h (new)
+  src/platform/TargetGeometry.cpp (new)
+  src/app/main.cpp
+  CMakeLists.txt
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  cmake --preset windows-debug
+  exit 0
+  reused gtest:x64-windows@1.17.0#3; SDK 10.0.26100.0; binaryDir out/build/windows-debug
+Build command + exit code:
+  cmake --build --preset windows-debug
+  exit 0
+  MSBuild 18.10.1-1.26427.6+3cd27c13e
+  TracingApp.exe 859648 bytes (2026-09-25 16:51:09)
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 2, passed 2, failed 0
+    TracingApp.BootstrapTests 0.20s
+    TracingApp.TargetSelectionTests 0.01s
+Manual setup and exact actions:
+  Extracted RT_MANIFEST #1 from TracingApp.exe (1286 bytes): dpiAware true/pm, dpiAwareness PerMonitorV2, asInvoker, Windows 10 supportedOS
+  Start-Process TracingApp.exe; wait 2s; GetDpiForWindow(MainWindowHandle); GetClientRect+ClientToScreen vs GetWindowRect; CloseMainWindow
+  Get-CimInstance Win32_Process filtered for clipstudio|csp: no matching processes
+Expected / actual:
+  expected: PerMonitorV2 manifest embedded; control window reports physical client bounds separately from outer window; clean exit
+  actual: PID 40136, MainWindowTitle=TracingApp, hwnd=0xC0CE0, GetDpiForWindow=96
+    client physical origin=(164,187) size=704x601
+    outer window (156,156)-(876,796) size=720x640 (client != outer, as required)
+    CloseMainWindow=True, ExitCode=0, no leftover TracingApp process
+  real CLIPStudioPaint.exe select/move/resize/minimize/restore/close NOT RUN (no CSP process)
+  mixed-DPI monitor movement NOT RUN (both displays effective DPI 96)
+  negative-origin monitor NOT RUN (no monitor with origin < 0)
+Evidence paths (local, no private artwork committed):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/build/windows-debug/Debug/TracingApp.BootstrapTests.exe
+  out/build/windows-debug/Debug/TracingApp.TargetSelectionTests.exe
+Measured samples / p50 / p95 / max where applicable: n/a
+Known limitations / unavailable hardware:
+  CLIP STUDIO PAINT not running; CSP version/locale/theme NOT RECORDED
+  Release configure/build/test NOT RUN this step
+  both monitors 96 DPI; no negative-origin display
+  geometry policy unit tests deferred (would be a sixth file: tests/unit/TargetGeometryTests.cpp)
+  canvas ROI is intentionally not reported; client physical bounds are not canvas bounds
+  WinEvent is OUTOFCONTEXT only; no process injection
+Manual checklist remaining for real CSP geometry:
+  1. Start CLIP STUDIO PAINT with a document window (not only the launcher).
+  2. Run TracingApp.exe, Refresh, Select a PAINT row.
+  3. Confirm status shows target gen, geom gen, client physical origin/size/DPI, outer window separately, and "not canvas bounds".
+  4. Move and resize the painting window; geom generation should increment when client origin, size, or DPI changes.
+  5. If a differently scaled monitor exists, drag CSP onto it and record expected vs observed client origin/size/DPI.
+  6. If a negative-origin monitor exists, drag CSP onto it and record a negative client origin.
+  7. Minimize, restore, then close CSP; eligibility should become minimized then target-dead, and the target must clear (no silent HWND reuse).
+Blocker or next prompt: 05 — Shared D3D11 device
 ```
 
 ## Final acceptance

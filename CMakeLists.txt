@@ -23,8 +23,11 @@ set(TRACING_APP_PLATFORM_SOURCES
 
 add_executable(TracingApp WIN32
     src/app/main.cpp
-    ${TRACING_APP_PLATFORM_SOURCES})
+    ${TRACING_APP_PLATFORM_SOURCES}
+    src/platform/TargetGeometry.cpp
+    resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
+target_link_libraries(TracingApp PRIVATE dwmapi)
 
 add_executable(TracingApp.BootstrapTests
     tests/unit/bootstrap_tests.cpp

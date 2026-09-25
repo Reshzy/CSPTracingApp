@@ -17,25 +17,39 @@ bool IsValidControlViewport(int width, int height) noexcept
 #ifndef TRACING_APP_TESTING
 
 #include "platform/TargetDiscovery.h"
+#include "platform/TargetGeometry.h"
 
 namespace {
 constexpr int kDefaultWidth = 720;
-constexpr int kDefaultHeight = 520;
+constexpr int kDefaultHeight = 640;
 constexpr wchar_t kWindowClass[] = L"TracingAppControlWindow";
 constexpr wchar_t kWindowTitle[] = L"TracingApp";
 constexpr int kIdList = 1001;
 constexpr int kIdRefresh = 1002;
 constexpr int kIdSelect = 1003;
 constexpr int kIdStatus = 1004;
+constexpr UINT kMsgGeometry = WM_APP + 1;
+constexpr UINT_PTR kTimerGeometry = 1;
+constexpr UINT kGeometryPollMs = 250;
 
 struct ControlState
 {
+    HWND control = nullptr;
     HWND list = nullptr;
     HWND status = nullptr;
     std::vector<tracing::platform::WindowCandidate> candidates;
     std::optional<tracing::platform::TargetIdentity> selected;
+    tracing::platform::TargetLifecycleWatcher watcher;
+    tracing::platform::GeometrySnapshot lastGeometry;
     std::uint64_t nextGeneration = 1;
 };
+
+std::wstring ControlDpiLine(HWND hwnd)
+{
+    unsigned const dpi = hwnd != nullptr ? GetDpiForWindow(hwnd) : 0;
+    return L"control DPI=" + std::to_wstring(dpi) +
+           L" (physical, PerMonitorV2; not canvas bounds)\r\n";
+}
 
 void SetStatus(ControlState& state, std::wstring const& text)
 {
@@ -43,6 +57,91 @@ void SetStatus(ControlState& state, std::wstring const& text)
     {
         SetWindowTextW(state.status, text.c_str());
     }
+}
+
+void StopWatching(ControlState& state)
+{
+    state.watcher.Detach();
+    if (state.control != nullptr)
+    {
+        KillTimer(state.control, kTimerGeometry);
+    }
+    state.lastGeometry = {};
+}
+
+void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
+{
+    std::wstring text = ControlDpiLine(state.control);
+    if (!state.selected.has_value())
+    {
+        if (!extra.empty())
+        {
+            text += extra;
+        }
+        SetStatus(state, text);
+        return;
+    }
+
+    tracing::platform::GeometrySnapshot sampled{};
+    std::wstring error;
+    bool const ok = tracing::platform::QueryPhysicalGeometry(*state.selected, sampled, error);
+    if (!ok)
+    {
+        if (sampled.identity == tracing::platform::IdentityCheck::WindowDead ||
+            sampled.identity == tracing::platform::IdentityCheck::HandleReused)
+        {
+            StopWatching(state);
+            state.selected.reset();
+            text += error;
+            if (!extra.empty())
+            {
+                text += L"\r\n";
+                text += extra;
+            }
+            SetStatus(state, text);
+            return;
+        }
+        text += error;
+        text += L"\r\n";
+        text += tracing::platform::FormatGeometryReport(sampled);
+        if (!extra.empty())
+        {
+            text += L"\r\n";
+            text += extra;
+        }
+        SetStatus(state, text);
+        return;
+    }
+
+    sampled.geometryGeneration =
+        tracing::platform::NextGeometryGeneration(state.lastGeometry, sampled);
+    state.lastGeometry = sampled;
+    text += tracing::platform::FormatGeometryReport(sampled);
+    if (!extra.empty())
+    {
+        text += L"\r\n";
+        text += extra;
+    }
+    SetStatus(state, text);
+}
+
+bool StartWatching(ControlState& state, std::wstring& hookError)
+{
+    hookError.clear();
+    if (!state.selected.has_value() || state.control == nullptr)
+    {
+        hookError = L"Cannot watch geometry without a selected target.";
+        return false;
+    }
+
+    StopWatching(state);
+    bool const hooked = state.watcher.Attach(
+        state.control,
+        state.selected->hwnd,
+        kMsgGeometry,
+        hookError);
+    SetTimer(state.control, kTimerGeometry, kGeometryPollMs, nullptr);
+    return hooked;
 }
 
 void RefillList(ControlState& state)
@@ -73,7 +172,7 @@ void RefreshCandidates(ControlState& state)
     std::wstring error;
     if (!tracing::platform::EnumerateTopLevelCandidates(state.candidates, error))
     {
-        SetStatus(state, error);
+        SetStatus(state, ControlDpiLine(state.control) + error);
         return;
     }
     RefillList(state);
@@ -112,36 +211,47 @@ void RefreshCandidates(ControlState& state)
             observed.creationTime);
         if (check == tracing::platform::IdentityCheck::WindowDead)
         {
+            StopWatching(state);
             state.selected.reset();
             SetStatus(
                 state,
-                L"Previous target is gone. HWND is no longer valid; select a painting window again.");
+                ControlDpiLine(state.control) +
+                    L"Previous target is gone. HWND is no longer valid; geometry invalidated. "
+                    L"Select a painting window again.");
             return;
         }
         if (check == tracing::platform::IdentityCheck::HandleReused)
         {
+            StopWatching(state);
             state.selected.reset();
             SetStatus(
                 state,
-                L"Previous HWND was reused by another process. Target cleared so a launcher or "
-                L"second instance cannot silently replace it. Select again.");
+                ControlDpiLine(state.control) +
+                    L"Previous HWND was reused by another process. Target and geometry cleared so "
+                    L"a launcher or second instance cannot silently replace it. Select again.");
             return;
         }
         if (check == tracing::platform::IdentityCheck::AccessFailed)
         {
             SetStatus(
                 state,
-                accessError.empty()
-                    ? tracing::platform::FormatAccessFailure(stored.process.pid, ERROR_ACCESS_DENIED)
-                    : accessError);
+                ControlDpiLine(state.control) +
+                    (accessError.empty()
+                         ? tracing::platform::FormatAccessFailure(
+                               stored.process.pid, ERROR_ACCESS_DENIED)
+                         : accessError));
             return;
         }
+
+        RefreshGeometryDisplay(state, L"refreshed candidate list");
+        return;
     }
 
     SetStatus(
         state,
-        L"Refreshed top-level windows. Select a PAINT row (CLIPStudioPaint.exe), then Select. "
-        L"Launcher rows are never chosen automatically.");
+        ControlDpiLine(state.control) +
+            L"Refreshed top-level windows. Select a PAINT row (CLIPStudioPaint.exe), then Select. "
+            L"Launcher rows are never chosen automatically.");
 }
 
 void SelectFromUi(ControlState& state)
@@ -161,12 +271,25 @@ void SelectFromUi(ControlState& state)
         state.candidates,
         userIndex,
         state.nextGeneration);
-    SetStatus(state, selection.message);
-    if (selection.status == tracing::platform::SelectionStatus::Selected)
+    if (selection.status != tracing::platform::SelectionStatus::Selected)
     {
-        state.selected = selection.identity;
-        ++state.nextGeneration;
+        SetStatus(state, ControlDpiLine(state.control) + selection.message);
+        return;
     }
+
+    StopWatching(state);
+    state.selected = selection.identity;
+    ++state.nextGeneration;
+
+    std::wstring hookError;
+    bool const hooked = StartWatching(state, hookError);
+    std::wstring extra = selection.message;
+    if (!hooked)
+    {
+        extra += L"\r\n";
+        extra += hookError;
+    }
+    RefreshGeometryDisplay(state, extra);
 }
 
 LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -178,6 +301,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     case WM_CREATE:
     {
         auto* created = new ControlState();
+        created->control = hwnd;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(created));
         HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
         created->list = CreateWindowExW(
@@ -188,7 +312,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             12,
             12,
             680,
-            300,
+            240,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdList)),
             instance,
@@ -197,11 +321,11 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             0,
             L"STATIC",
             L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            368,
+            296,
             680,
-            100,
+            290,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -212,7 +336,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"Refresh",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             12,
-            324,
+            260,
             100,
             28,
             hwnd,
@@ -225,7 +349,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"Select",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             124,
-            324,
+            260,
             100,
             28,
             hwnd,
@@ -257,9 +381,30 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             }
         }
         break;
+    case kMsgGeometry:
+        if (state != nullptr && state->selected.has_value())
+        {
+            RefreshGeometryDisplay(*state, L"WinEvent");
+            return 0;
+        }
+        break;
+    case WM_TIMER:
+        if (state != nullptr && wParam == kTimerGeometry && state->selected.has_value())
+        {
+            RefreshGeometryDisplay(*state, L"");
+            return 0;
+        }
+        break;
+    case WM_DPICHANGED:
+        if (state != nullptr)
+        {
+            RefreshGeometryDisplay(*state, L"control DPI changed");
+        }
+        break;
     case WM_DESTROY:
         if (state != nullptr)
         {
+            StopWatching(*state);
             delete state;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         }
