@@ -6,9 +6,6 @@
 
 #include "graphics/DeviceResources.h"
 
-#include <dcomp.h>
-#include <dxgi1_2.h>
-
 #include <cstdint>
 #include <string>
 
@@ -175,7 +172,7 @@ inline std::wstring FormatObsVerification(OverlayObsVerification)
     return L"NOT RUN";
 }
 
-// Top-level DirectComposition overlay. DeviceResources is borrowed.
+// Top-level WS_EX_LAYERED overlay. DeviceResources is borrowed. Isolated from DirectComposition.
 class OverlaySurface
 {
 public:
@@ -222,12 +219,16 @@ private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     bool RegisterOverlayClass(HINSTANCE instance, std::wstring& error);
     bool CreateOverlayWindow(HINSTANCE instance, std::wstring& error);
-    bool CreateComposition(std::wstring& error);
+    bool CreateGpuSurfaces(unsigned width, unsigned height, std::wstring& error);
     bool ApplyExcludeFromCapture();
     bool ApplyHitTestStyles();
-    bool EnsureSwapChainSize(unsigned width, unsigned height, std::wstring& error);
-    bool BindBackBuffer(std::wstring& error);
+    bool EnsureSurfaceSize(unsigned width, unsigned height, std::wstring& error);
+    bool BindRenderTarget(std::wstring& error);
+    bool EnsureDib(unsigned width, unsigned height, std::wstring& error);
+    void ReleaseDib() noexcept;
+    void ReleaseGpuSurfaces() noexcept;
     bool DrawMarker(std::wstring& error);
+    bool PresentLayered(std::wstring& error);
     void HideWindowOnly();
     OverlayPlacement TestPatternPlacement() const;
     LONG_PTR CurrentExStyle() const noexcept;
@@ -235,17 +236,21 @@ private:
     DeviceResources* device_ = nullptr;
     HWND controlWindow_ = nullptr;
     HWND hwnd_ = nullptr;
-    Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain_;
-    Microsoft::WRL::ComPtr<IDCompositionDevice> compositionDevice_;
-    Microsoft::WRL::ComPtr<IDCompositionTarget> compositionTarget_;
-    Microsoft::WRL::ComPtr<IDCompositionVisual> compositionVisual_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuTexture_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTexture_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv_;
+    HDC dibDc_ = nullptr;
+    HBITMAP dibBitmap_ = nullptr;
+    HGDIOBJ dibOld_ = nullptr;
+    void* dibBits_ = nullptr;
     OverlayAffinityStatus affinity_{};
     OverlayVisibilityResult lastVisibility_{};
     OverlayPlacement lastPlacement_{};
-    unsigned swapWidth_ = 0;
-    unsigned swapHeight_ = 0;
+    unsigned surfaceWidth_ = 0;
+    unsigned surfaceHeight_ = 0;
     HRESULT lastPresentResult_ = S_OK;
+    unsigned long lastReadbackUs_ = 0;
+    unsigned long lastUlwUs_ = 0;
     bool contentReady_ = false;
     bool emergencyHidden_ = false;
     bool testPatternActive_ = false;

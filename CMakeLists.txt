@@ -29,7 +29,7 @@ add_executable(TracingApp WIN32
     src/graphics/OverlaySurface.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
-target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid dcomp)
+target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid gdi32)
 
 add_executable(TracingApp.BootstrapTests
     tests/unit/bootstrap_tests.cpp

@@ -1,12 +1,12 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Overlay is not usable for tracing until a layered-window fallback is proven. OBS recording remains Prompt 13.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Prompt 07-fallback replaced that path with an isolated WS_EX_LAYERED UpdateLayeredWindow presenter; InputProbe click/wheel pass-through now PASSes on both monitors, and tracing hits the titled CSP HWND without overlay activation. Pen/pressure remains NOT RUN. OBS recording remains Prompt 13.
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: HEAD `a8a391d` (`feature/init`, Prompt 07 files uncommitted); Win32 control window plus DirectComposition overlay HWND with tracing/alignment hit-test styles (test-pattern marker, no imported-image renderer, no WGC); Debug `out/build/windows-debug/Debug/TracingApp.exe` (938496 bytes, 2026-09-25 17:35:00) and `TracingApp.InputProbe.exe` (69632 bytes, 2026-09-25 17:35:02); Release not rebuilt this step
+- App commit/build and renderer path: HEAD `629c625` (`feature/init`, Prompt 07-fallback files uncommitted); Win32 control window plus isolated WS_EX_LAYERED overlay HWND (D3D11 test-pattern texture, staging readback, UpdateLayeredWindow; no DirectComposition, no imported-image renderer, no WGC); Debug `out/build/windows-debug/Debug/TracingApp.exe` (940032 bytes, 2026-09-25 18:02:53) and `TracingApp.InputProbe.exe` (70144 bytes, 2026-09-25 18:02:00); Release not rebuilt this step
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). SDR/HDR NOT RECORDED
 - Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
 - OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
@@ -19,7 +19,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 
 - M0 reproducible shell/build/tests: PASS (Prompts 01–02 plus Prompt 04 DPI manifest: local Git, Win32 control window, PerMonitorV2 RT_MANIFEST, vcpkg baseline, first-party `/W4` `/permissive-`, GoogleTest, Debug configure/build/test)
 - M1 CSP discovery/geometry/lifecycle: NOT RUN (Prompt 03 automated tests PASS; Prompt 06 enumerated live CLIPStudioPaint.exe and selected one PAINT row; mixed-DPI move, minimize/restore/close, and titled main-window vs panel disambiguation remain incomplete)
-- M2 transparency/input/affinity: FAIL for drawing pass-through (Prompt 07). Prompt 05 device PASS; Prompt 06 overlay HWND, test-pattern, WDA_EXCLUDEFROMCAPTURE set+readback, emergency hide, and visibility policy PASS. DirectComposition + `WS_EX_TRANSPARENT` + `HTTRANSPARENT` did not deliver mouse/wheel to another process; alignment mode did consume overlay clicks. Overlay must not be treated as usable. OBS Display Capture remains Prompt 13.
+- M2 transparency/input/affinity: PASS for layered mouse/wheel pass-through (Prompt 07-fallback). Prompt 05 device PASS; Prompt 06 affinity/emergency hide/visibility policy PASS; Prompt 07 DComp path FAIL (superseded). Layered `WS_EX_LAYERED` + tracing `WS_EX_TRANSPARENT` delivers InputProbe click/wheel on both monitors without overlay activation; titled CSP HWND hit-test also skips the overlay. Pen/pressure NOT RUN. OBS Display Capture remains Prompt 13.
 - M3 actual CSP capture/resize/no-feedback: NOT RUN
 - M4 imported image/ordinary reference/OBS playback: NOT RUN — mandatory before tracking
 - M5 manual transforms/calibration: NOT RUN
@@ -528,6 +528,73 @@ Manual checklist remaining:
   1. After a passing pass-through path exists: repeat InputProbe click/wheel/pen, then CSP mouse/wheel and pen pressure if hardware is present.
   2. Prompt 13: saved OBS Display Capture playback.
 Blocker or next prompt: 07-fallback — layered-window pass-through (Prompt 08 blocked)
+```
+
+```text
+Step / milestone: 07-fallback / M2 layered-window pass-through
+Date / commit: 2026-09-25 / working tree on feature/init ahead of 629c625 (uncommitted)
+Status: PASS for InputProbe mouse/wheel pass-through on both monitors, titled-CSP HWND hit-test, no overlay activation, emergency hide, affinity set+readback, and Debug configure/build/test. Pen/pressure NOT RUN. Do not treat OBS exclusion as proven.
+Changed files:
+  src/graphics/OverlaySurface.h
+  src/graphics/OverlaySurface.cpp
+  src/app/main.cpp
+  tests/harness/InputProbe.cpp
+  CMakeLists.txt
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  cmake --preset windows-debug
+  exit 0
+  reused gtest:x64-windows@1.17.0#3; SDK 10.0.26100.0; binaryDir out/build/windows-debug
+Build command + exit code:
+  cmake --build --preset windows-debug
+  exit 0
+  MSBuild 18.10.1-1.26427.6+3cd27c13e
+  TracingApp.exe 940032 bytes (2026-09-25 18:02:53)
+  TracingApp.InputProbe.exe 70144 bytes (2026-09-25 18:02:00)
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 5, passed 5, failed 0
+    TracingApp.BootstrapTests
+    TracingApp.TargetSelectionTests
+    TracingApp.GraphicsPolicyTests
+    TracingApp.OverlayPolicyTests
+    TracingApp.InputProbe (--self-test of probe counters only; not overlay pass-through)
+Manual setup and exact actions:
+  DirectComposition was removed. Overlay is WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, plus WS_EX_TRANSPARENT in tracing. Test pattern is drawn to a BGRA D3D11 texture, copied to a staging resource, and presented with UpdateLayeredWindow (ULW_ALPHA, premultiplied). WDA_EXCLUDEFROMCAPTURE is still applied before show.
+  Dual-monitor virtual desktop origin=(0,0) size=4480x1440. DISPLAY2 primary {0,0,1920x1080}; DISPLAY1 {1920,0,2560x1440}.
+  1. Start TracingApp.InputProbe.exe PID 18996 and TracingApp.exe PID 46472 (different processes). Park control at (1000,80) so it does not overlap the probe.
+  2. Primary DISPLAY2: Cover input probe. Overlay origin=(88,111) size=640x480, layered=yes noredirectionbitmap=no transparent=yes affinity readback=0x11 present=0x00000000 readbackUs=244 ulwUs=75.
+  3. WindowFromPoint tracing at (408,351) returned TracingAppInputProbe (not overlay).
+  4. SendInput click+wheel at that point: probe down 0->1 and wheel 0->1; overlay consumed stayed 0; foreground became the probe (isOverlay=false).
+  5. Alignment mode: WindowFromPoint returned TracingAppOverlayWindow; probe counters unchanged. Overlay WndProc consumed mouseDown stayed 0 for synthesized clicks (layered WS_EX_NOACTIVATE did not deliver WM_LBUTTONDOWN); intercept is the WindowFromPoint result plus probe-not-incrementing.
+  6. Return to tracing: another SendInput click incremented probe again (no stuck alignment input).
+  7. Emergency Hide: overlay visible=no reason=emergency-hidden.
+  8. Secondary DISPLAY1: probe/overlay origin=(2008,111). WindowFromPoint (2328,351) returned InputProbe. Click 2->3 and wheel 1->2; overlay consumed 0. Alignment WindowFromPoint overlay; return-to-tracing click incremented probe; emergency hide again.
+  9. Titled CLIP STUDIO PAINT hwnd 0x70E9A pid 36888 selected (not a small panel). Overlay shown-on-target origin=(1920,0) size=2560x1439. WindowFromPoint returned a CSP child hwnd in the same pid; overlay consumed 0; GetForegroundWindow stayed CLIP STUDIO PAINT. Pen/pressure NOT RUN.
+Expected / actual:
+  expected: mouse/wheel reach a different process beneath the overlay without activating it; alignment intercepts; emergency hide remains; measure readback/upload
+  actual: InputProbe click/wheel PASS on DISPLAY2 and DISPLAY1; overlay never became foreground; alignment hit-test intercepts; emergency hide PASS; CSP HWND pass-through PASS; measured GPU staging+row copy and UpdateLayeredWindow microseconds (640x480 typically readbackUs 200-800 / ulwUs 70-100; 2560x1439 CSP rect readbackUs 3922-4955 / ulwUs 706-1595)
+Evidence paths (local, no private artwork committed):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/build/windows-debug/Debug/TracingApp.InputProbe.exe
+  out/manual/prompt07-fallback-passthrough.txt
+Measured samples / p50 / p95 / max where applicable:
+  640x480 test-pattern present: readbackUs samples 244, 542, 765, 923, 1932; ulwUs samples 75, 87, 92, 86, 79
+  2560x1439 CSP client present: readbackUs 3922 and 4955; ulwUs 1595 and 706
+Known limitations / unavailable hardware:
+  cmake/ctest not on PATH; invoked via VS 2026 bundled binaries
+  Release configure/build/test NOT RUN this step
+  DirectComposition path removed (MASTER forbids mixing layered and composition presenters)
+  Alignment SendInput did not increment overlay consumed counters; intercept is proven by WindowFromPoint + probe-not-incrementing
+  CSP canvas stroke/pressure NOT RUN (no pen evidence this step)
+  OBS Display Capture still NOT RUN; layered HWND affinity must be re-verified in Prompt 13
+  mixed-DPI still both 96; no negative-origin monitor
+Manual checklist remaining:
+  1. Pen/pressure on CSP if a tablet is available.
+  2. Prompt 13: saved OBS Display Capture playback on this layered HWND.
+Blocker or next prompt: 08 — WGC session and owned frames
 ```
 
 ## Final acceptance

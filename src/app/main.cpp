@@ -385,6 +385,27 @@ void OnAlignmentMode(ControlState& state)
         L"Interaction mode: alignment (overlay accepts input).");
 }
 
+std::wstring FormatMonitorDevice(POINT origin)
+{
+    HMONITOR const monitor = MonitorFromPoint(origin, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info) == FALSE)
+    {
+        return L"monitor=unknown";
+    }
+    return std::wstring(L"monitor=") + info.szDevice;
+}
+
+std::wstring FormatVirtualDesktop()
+{
+    return L"virtualScreen origin=(" +
+           std::to_wstring(GetSystemMetrics(SM_XVIRTUALSCREEN)) + L"," +
+           std::to_wstring(GetSystemMetrics(SM_YVIRTUALSCREEN)) + L") size=" +
+           std::to_wstring(GetSystemMetrics(SM_CXVIRTUALSCREEN)) + L"x" +
+           std::to_wstring(GetSystemMetrics(SM_CYVIRTUALSCREEN));
+}
+
 void OnCoverInputProbe(ControlState& state)
 {
     HWND const probe = FindWindowW(L"TracingAppInputProbe", nullptr);
@@ -428,7 +449,11 @@ void OnCoverInputProbe(ControlState& state)
         state,
         L"Cover input probe: test-pattern over TracingAppInputProbe PID " +
             std::to_wstring(probePid) +
-            L" (different process; not a CSP target).");
+            L" (different process; not a CSP target).\r\nprobe client origin=(" +
+            std::to_wstring(origin.x) + L"," + std::to_wstring(origin.y) + L") size=" +
+            std::to_wstring(placement.width) + L"x" + std::to_wstring(placement.height) +
+            L"\r\n" + FormatMonitorDevice(origin) + L" " + FormatVirtualDesktop() +
+            L"\r\nSendInput must use virtual-desktop absolute mapping, not primary-only.");
 }
 
 LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)

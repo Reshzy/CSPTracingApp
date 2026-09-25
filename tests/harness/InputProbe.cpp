@@ -23,6 +23,9 @@
 #ifndef PT_PEN
 #define PT_PEN 3
 #endif
+#ifndef PT_MOUSE
+#define PT_MOUSE 4
+#endif
 
 namespace {
 
@@ -30,12 +33,11 @@ constexpr wchar_t kProbeClass[] = L"TracingAppInputProbe";
 constexpr wchar_t kProbeTitle[] = L"TracingApp InputProbe";
 constexpr int kClientWidth = 640;
 constexpr int kClientHeight = 480;
-constexpr int kIdCounts = 2001;
 
 struct ProbeState
 {
     HWND window = nullptr;
-    HWND counts = nullptr;
+    wchar_t body[768]{};
     unsigned mouseDown = 0;
     unsigned mouseUp = 0;
     unsigned wheel = 0;
@@ -48,13 +50,29 @@ struct ProbeState
 void RefreshCounts(ProbeState& state)
 {
     bool const foreground = state.window != nullptr && GetForegroundWindow() == state.window;
-    wchar_t text[512]{};
+    POINT origin{0, 0};
+    int clientW = 0;
+    int clientH = 0;
+    if (state.window != nullptr)
+    {
+        RECT client{};
+        if (GetClientRect(state.window, &client) != FALSE)
+        {
+            clientW = client.right - client.left;
+            clientH = client.bottom - client.top;
+            origin.x = client.left;
+            origin.y = client.top;
+            ClientToScreen(state.window, &origin);
+        }
+    }
     swprintf_s(
-        text,
+        state.body,
         L"TracingApp InputProbe (other process)\r\n"
         L"mouseDown=%u mouseUp=%u wheel=%u\r\n"
         L"penDown=%u penUpdate=%u lastPressure=%u%s\r\n"
-        L"foregroundSelf=%s",
+        L"foregroundSelf=%s\r\n"
+        L"client origin=(%ld,%ld) size=%dx%d\r\n"
+        L"virtualScreen origin=(%d,%d) size=%dx%d",
         state.mouseDown,
         state.mouseUp,
         state.wheel,
@@ -62,11 +80,15 @@ void RefreshCounts(ProbeState& state)
         state.pointerPenUpdate,
         state.lastPenPressure,
         state.lastPenPressureValid ? L"" : L" (none)",
-        foreground ? L"yes" : L"no");
-    if (state.counts != nullptr)
-    {
-        SetWindowTextW(state.counts, text);
-    }
+        foreground ? L"yes" : L"no",
+        origin.x,
+        origin.y,
+        clientW,
+        clientH,
+        GetSystemMetrics(SM_XVIRTUALSCREEN),
+        GetSystemMetrics(SM_YVIRTUALSCREEN),
+        GetSystemMetrics(SM_CXVIRTUALSCREEN),
+        GetSystemMetrics(SM_CYVIRTUALSCREEN));
     wchar_t title[256]{};
     swprintf_s(
         title,
@@ -78,6 +100,7 @@ void RefreshCounts(ProbeState& state)
     if (state.window != nullptr)
     {
         SetWindowTextW(state.window, title);
+        InvalidateRect(state.window, nullptr, TRUE);
     }
 }
 
@@ -116,20 +139,6 @@ LRESULT CALLBACK ProbeWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         created->window = hwnd;
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(created));
         EnableMouseInPointer(TRUE);
-        HINSTANCE instance = reinterpret_cast<HINSTANCE>(GetWindowLongPtrW(hwnd, GWLP_HINSTANCE));
-        created->counts = CreateWindowExW(
-            0,
-            L"STATIC",
-            L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-            16,
-            16,
-            600,
-            200,
-            hwnd,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdCounts)),
-            instance,
-            nullptr);
         RefreshCounts(*created);
         return 0;
     }
@@ -158,7 +167,16 @@ LRESULT CALLBACK ProbeWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
     case WM_POINTERDOWN:
         if (state != nullptr)
         {
-            NotePen(*state, wParam, true);
+            UINT32 const pointerId = GET_POINTERID_WPARAM(wParam);
+            POINTER_INPUT_TYPE type{};
+            if (GetPointerType(pointerId, &type) != FALSE && type == PT_PEN)
+            {
+                NotePen(*state, wParam, true);
+            }
+            else
+            {
+                ++state->mouseDown;
+            }
             RefreshCounts(*state);
         }
         return 0;
@@ -176,6 +194,13 @@ LRESULT CALLBACK ProbeWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
             RefreshCounts(*state);
         }
         return 0;
+    case WM_MOVE:
+    case WM_SIZE:
+        if (state != nullptr)
+        {
+            RefreshCounts(*state);
+        }
+        return DefWindowProcW(hwnd, message, wParam, lParam);
     case WM_ERASEBKGND:
     {
         HDC dc = reinterpret_cast<HDC>(wParam);
@@ -185,6 +210,21 @@ LRESULT CALLBACK ProbeWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPa
         FillRect(dc, &client, brush);
         DeleteObject(brush);
         return 1;
+    }
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(hwnd, &paint);
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, RGB(240, 240, 240));
+        if (state != nullptr)
+        {
+            DrawTextW(dc, state->body, -1, &client, DT_LEFT | DT_TOP | DT_NOPREFIX);
+        }
+        EndPaint(hwnd, &paint);
+        return 0;
     }
     case WM_DESTROY:
         if (state != nullptr)
