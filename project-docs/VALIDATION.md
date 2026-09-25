@@ -1,12 +1,12 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Prompt 07-fallback replaced that path with an isolated WS_EX_LAYERED UpdateLayeredWindow presenter; InputProbe click/wheel pass-through now PASSes on both monitors, and tracing hits the titled CSP HWND without overlay activation. Prompt 08 added a C++/WinRT WGC session with a free-threaded frame pool, owned-frame handoff, and control-window counters/metadata. Prompt 09 added an opt-in ordinary WDA_NONE capture preview, frame-pool Recreate on content-size change, measured capture-to-client mapping, and overlay hide on capture loss. Pen/pressure remains NOT RUN. OBS recording remains Prompt 13.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains incomplete. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests. Prompt 06 added a DirectComposition overlay HWND, WDA_EXCLUDEFROMCAPTURE before show, emergency hide, and GPU-free visibility tests. Prompt 07 added tracing/alignment modes and a separate-process InputProbe; the DirectComposition HWND/style combination failed cross-process mouse/wheel pass-through. Prompt 07-fallback replaced that path with an isolated WS_EX_LAYERED UpdateLayeredWindow presenter; InputProbe click/wheel pass-through now PASSes on both monitors, and tracing hits the titled CSP HWND without overlay activation. Prompt 08 added a C++/WinRT WGC session with a free-threaded frame pool, owned-frame handoff, and control-window counters/metadata. Prompt 09 added an opt-in ordinary WDA_NONE capture preview, frame-pool Recreate on content-size change, measured capture-to-client mapping, and overlay hide on capture loss. Prompt 10 added Unicode IFileOpenDialog plus WIC PNG/JPEG decode into an owned 32bppPBGRA buffer with 16,384/axis and 256-MiB limits; overlay is still the test marker (not an imported-image renderer). Pen/pressure remains NOT RUN. OBS recording remains Prompt 13.
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: HEAD `9edfc8a` (`feature/init`, Prompt 09 files uncommitted); Win32 control window plus isolated WS_EX_LAYERED overlay HWND (D3D11 test-pattern texture, staging readback, UpdateLayeredWindow; no DirectComposition, no imported-image renderer); WGC session copies owned D3D textures, Recreates the free-threaded pool on content-size change, and can show an ordinary WDA_NONE debug preview (off by default); Debug `out/build/windows-debug/Debug/TracingApp.exe` (2033664 bytes, 2026-09-25 18:55:23) and `TracingApp.InputProbe.exe` (70144 bytes, 2026-09-25 18:02:00); Release not rebuilt this step
+- App commit/build and renderer path: HEAD `9e82224` (`feature/init`, Prompt 10 files uncommitted); Win32 control window plus isolated WS_EX_LAYERED overlay HWND (D3D11 test-pattern texture, staging readback, UpdateLayeredWindow; no DirectComposition, no imported-image renderer); WIC decode owns a CPU 32bppPBGRA buffer and is not uploaded to the overlay; WGC session copies owned D3D textures, Recreates the free-threaded pool on content-size change, and can show an ordinary WDA_NONE debug preview (off by default); Debug `out/build/windows-debug/Debug/TracingApp.exe` (2149888 bytes, 2026-09-25 19:30:20) and `TracingApp.InputProbe.exe` (70144 bytes, 2026-09-25 18:02:00); Release not rebuilt this step
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). SDR/HDR NOT RECORDED
 - Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
 - OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
@@ -21,7 +21,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 - M1 CSP discovery/geometry/lifecycle: NOT RUN (Prompt 03 automated tests PASS; Prompt 06 enumerated live CLIPStudioPaint.exe and selected one PAINT row; mixed-DPI move, minimize/restore/close, and titled main-window vs panel disambiguation remain incomplete)
 - M2 transparency/input/affinity: PASS for layered mouse/wheel pass-through (Prompt 07-fallback). Prompt 05 device PASS; Prompt 06 affinity/emergency hide/visibility policy PASS; Prompt 07 DComp path FAIL (superseded). Layered `WS_EX_LAYERED` + tracing `WS_EX_TRANSPARENT` delivers InputProbe click/wheel on both monitors without overlay activation; titled CSP HWND hit-test also skips the overlay. Pen/pressure NOT RUN. OBS Display Capture remains Prompt 13.
 - M3 actual CSP capture/resize/no-feedback: PASS for titled CLIP STUDIO PAINT WGC preview + pool Recreate + marker-absent-from-capture-texture (Prompt 09). Prompt 08 counters/content-size remain PASS. Item-closed (CSP close while capturing) NOT RUN. OBS Display Capture remains Prompt 13.
-- M4 imported image/ordinary reference/OBS playback: NOT RUN — mandatory before tracking
+- M4 imported image/ordinary reference/OBS playback: PARTIAL — WIC PNG/JPEG Unicode import PASS (Prompt 10); ordinary ReferenceWindow and OBS Display Capture remain Prompts 12–13. Mandatory OBS gate still NOT RUN before tracking.
 - M5 manual transforms/calibration: NOT RUN
 - M6 visual/parity tracking and confidence safety: NOT RUN
 - M7 hybrid observers/fusion: NOT RUN
@@ -39,7 +39,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 - [ ] Modal dialogs/floating palettes do not have misleading tracing content above them.
 - [ ] Captured CSP pixels update; resize/stale/closed capture handled.
 - [ ] Capture/client offsets calibrated; overlay absent from actual CSP capture.
-- [ ] PNG/JPEG/Unicode path/corrupt/oversized images handled.
+- [x] PNG/JPEG/Unicode path/corrupt/oversized images handled.
 - [ ] Ordinary reference HWND remains WDA_NONE and independent of tracking.
 - [ ] OBS Display Capture positive control records both nonsensitive markers.
 - [ ] Exclusion test playback omits private marker with intact underlying CSP.
@@ -734,6 +734,81 @@ Manual checklist remaining:
   2. Prompt 10: WIC image import.
   3. Prompt 13: saved OBS Display Capture playback.
 Blocker or next prompt: 10 — WIC image import
+```
+
+```text
+Step / milestone: 10 / M4 WIC image import (decode only)
+Date / commit: 2026-09-25 / working tree on feature/init ahead of 9e82224 (uncommitted)
+Status: PASS for Debug configure/build/test, generated PNG/JPEG/alpha/Unicode/corrupt/BMP-reject/oversized-IHDR/slot-preserve tests, EXIF orientation 6 roundtrip, and IFileOpenDialog import of valid PNG/JPEG plus corrupt keep-previous and Unicode path. Overlay remains test-pattern (not uploaded). Ordinary ReferenceWindow and OBS remain later prompts.
+Changed files:
+  src/image/ImageLoader.h (new)
+  src/image/ImageLoader.cpp (new)
+  src/app/main.cpp
+  CMakeLists.txt
+  tests/unit/ImageLoaderTests.cpp (new)
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  cmake --preset windows-debug
+  exit 0
+  reused gtest:x64-windows@1.17.0#3; SDK 10.0.26100.0; CXX MSVC 19.51.36260.0; binaryDir out/build/windows-debug
+Build command + exit code:
+  first cmake --build --preset windows-debug: exit 1
+    windows.h min/max macros vs std::numeric_limits::max; UNICODE DeleteFile name clash in tests
+  cmake --build --preset windows-debug (after INT_MAX/UINT64_MAX and RemoveTempFile)
+  exit 0
+  MSBuild 18.10.1-1.26427.6+3cd27c13e
+  TracingApp.exe 2149888 bytes (2026-09-25 19:30:20)
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 7, passed 7, failed 0
+    TracingApp.BootstrapTests
+    TracingApp.TargetSelectionTests
+    TracingApp.GraphicsPolicyTests
+    TracingApp.OverlayPolicyTests
+    TracingApp.CaptureStateTests
+    TracingApp.ImageLoaderTests
+    TracingApp.InputProbe (--self-test of probe counters only)
+  ImageLoaderTests: 14 tests from 3 suites, all PASSED (28 ms)
+    ImageLimits: zero/negative, axis>16384, 16384x1 and 8192x8192 at 256 MiB, 8193x8192 over budget
+    ImageOrientationMap: EXIF 1-8 to WIC transform flags; leaf 测试.png
+    ImageComTest: PNG premul A=128 -> BGRA 0,0,128,128; JPEG opaque A=255; Unicode path; corrupt fail;
+      BMP unsupported-container WINCODEC_ERR_UNKNOWNIMAGEFORMAT; IHDR width=20000 rejected;
+      LoadedImageSlot keeps previous; JPEG EXIF orientation 6 swapped 4x1 -> 1x4 (not skipped);
+      empty path E_INVALIDARG
+Manual setup and exact actions:
+  Generated local ignored fixtures (not committed): out/manual/prompt10-valid.png 4x3, prompt10-valid.jpg 4x3, prompt10-corrupt.png 7 bytes, out/manual/unicodé-路径/测试.png.
+  1. Start TracingApp.exe PID 32464. Status image loaded=no. CloseMainWindow=True ExitCode=0.
+  2. Start TracingApp.exe. Click Import image (IFileOpenDialog title "Import reference PNG or JPEG").
+  3. Open prompt10-valid.png: loaded=yes leaf="prompt10-valid.png" size=4x3 stride=16 format=32bppPBGRA premultiplied container=png bytes=48. Overlay report still "test pattern, not imported image".
+  4. Open prompt10-valid.jpg: replaced, container=jpeg size=4x3.
+  5. Open prompt10-corrupt.png: lastHr=0x88982F50 reason=decoder-create-failed; previous jpeg preserved.
+  6. Open unicodé-路径/测试.png: loaded leaf="测试.png" container=png size=4x3.
+  7. Import cancelled (ESC): 测试.png still loaded.
+  8. CloseMainWindow=True ExitCode=0 leftover none.
+Expected / actual:
+  expected: Unicode file selection; WIC PNG/JPEG to owned 32bppPBGRA premul once; 16384/axis and 256 MiB checked before alloc; fail keeps previous; decode independent of overlay
+  actual: matches; status explicitly "decode only; not uploaded to overlay"
+Evidence paths (local, no private artwork committed):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/build/windows-debug/Debug/TracingApp.ImageLoaderTests.exe
+  out/manual/prompt10-import.txt
+  out/manual/prompt10-valid.png
+  out/manual/prompt10-valid.jpg
+  out/manual/prompt10-corrupt.png
+Measured samples / p50 / p95 / max where applicable: n/a
+Known limitations / unavailable hardware:
+  cmake/ctest not on PATH; invoked via VS 2026 bundled binaries
+  Release configure/build/test NOT RUN this step
+  imported pixels are not drawn on the overlay (Prompt 11)
+  ordinary ReferenceWindow not added (Prompt 12)
+  OBS Display Capture still NOT RUN (Prompt 13)
+  mixed-DPI still both 96; no negative-origin monitor
+Manual checklist remaining:
+  1. Prompt 11: upload decoded image to overlay renderer.
+  2. Prompt 13: saved OBS Display Capture playback.
+Blocker or next prompt: 11 — Image renderer
 ```
 
 ## Final acceptance

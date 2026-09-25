@@ -5,6 +5,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,10 +20,14 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include <Unknwn.h>
 #include <winrt/base.h>
 
+#include <shobjidl.h>
+#include <wrl/client.h>
+
 #include "capture/CaptureSession.h"
 #include "graphics/CapturePreview.h"
 #include "graphics/DeviceResources.h"
 #include "graphics/OverlaySurface.h"
+#include "image/ImageLoader.h"
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
 
@@ -43,6 +48,7 @@ constexpr int kIdCoverProbe = 1009;
 constexpr int kIdStartCapture = 1010;
 constexpr int kIdStopCapture = 1011;
 constexpr int kIdEnablePreview = 1012;
+constexpr int kIdImportImage = 1013;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -63,6 +69,7 @@ struct ControlState
     tracing::graphics::OverlaySurface overlay;
     tracing::graphics::CapturePreview preview;
     tracing::capture::CaptureSession capture;
+    tracing::image::LoadedImageSlot image;
     HWND previewCheck = nullptr;
     bool hideOverlayOnCaptureLoss = false;
     std::uint64_t nextGeneration = 1;
@@ -143,6 +150,7 @@ std::wstring StatusHeader(ControlState const& state)
            state.overlay.FormatReport() + L"\r\n" + state.capture.FormatReport() + L"\r\n" +
            state.preview.FormatReport() + L"\r\n" +
            tracing::graphics::FormatCaptureToClientMapping(MappingFromState(state)) + L"\r\n" +
+           state.image.FormatReport() + L"\r\n" +
            L"overlayHiddenOnCaptureLoss=" +
            std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") + L"\r\n";
 }
@@ -531,6 +539,92 @@ void OnEnablePreview(ControlState& state)
     SetStatusWithOverlay(state, L"Capture preview disabled (recording-safe default).");
 }
 
+void OnImportImage(ControlState& state)
+{
+    Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
+    HRESULT hr = CoCreateInstance(
+        CLSID_FileOpenDialog,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&dialog));
+    if (FAILED(hr) || !dialog)
+    {
+        wchar_t buffer[16]{};
+        swprintf_s(buffer, L"0x%08X", static_cast<unsigned>(hr));
+        SetStatusWithOverlay(
+            state,
+            std::wstring(L"Import image: CoCreateInstance IFileOpenDialog failed hr=") + buffer);
+        return;
+    }
+
+    COMDLG_FILTERSPEC const filters[] = {
+        {L"PNG and JPEG", L"*.png;*.jpg;*.jpeg"},
+        {L"PNG", L"*.png"},
+        {L"JPEG", L"*.jpg;*.jpeg"},
+    };
+    dialog->SetFileTypes(ARRAYSIZE(filters), filters);
+    dialog->SetTitle(L"Import reference PNG or JPEG");
+    DWORD options = 0;
+    if (SUCCEEDED(dialog->GetOptions(&options)))
+    {
+        dialog->SetOptions(options | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
+    }
+
+    hr = dialog->Show(state.control);
+    if (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED))
+    {
+        SetStatusWithOverlay(state, L"Import image cancelled; previous image preserved.");
+        return;
+    }
+    if (FAILED(hr))
+    {
+        wchar_t buffer[16]{};
+        swprintf_s(buffer, L"0x%08X", static_cast<unsigned>(hr));
+        SetStatusWithOverlay(
+            state,
+            std::wstring(L"Import image: IFileOpenDialog::Show failed hr=") + buffer);
+        return;
+    }
+
+    Microsoft::WRL::ComPtr<IShellItem> item;
+    hr = dialog->GetResult(&item);
+    if (FAILED(hr) || !item)
+    {
+        wchar_t buffer[16]{};
+        swprintf_s(buffer, L"0x%08X", static_cast<unsigned>(hr));
+        SetStatusWithOverlay(
+            state,
+            std::wstring(L"Import image: GetResult failed hr=") + buffer);
+        return;
+    }
+
+    PWSTR filePath = nullptr;
+    hr = item->GetDisplayName(SIGDN_FILESYSPATH, &filePath);
+    if (FAILED(hr) || filePath == nullptr)
+    {
+        wchar_t buffer[16]{};
+        swprintf_s(buffer, L"0x%08X", static_cast<unsigned>(hr));
+        SetStatusWithOverlay(
+            state,
+            std::wstring(L"Import image: GetDisplayName failed hr=") + buffer);
+        return;
+    }
+    std::wstring const path(filePath);
+    CoTaskMemFree(filePath);
+
+    std::wstring error;
+    if (state.image.TryLoad(path, error))
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Imported image (WIC decode only; overlay still test-pattern, not uploaded).");
+        return;
+    }
+    SetStatusWithOverlay(
+        state,
+        L"Import failed; previous image preserved.\r\n" + error);
+}
+
 void StartCaptureNow(ControlState& state)
 {
     if (!state.selected.has_value())
@@ -814,6 +908,19 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             instance,
             nullptr);
         SendMessageW(created->previewCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Import image",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            240,
+            284,
+            140,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdImportImage)),
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -894,6 +1001,11 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdEnablePreview && code == BN_CLICKED)
             {
                 OnEnablePreview(*state);
+                return 0;
+            }
+            if (id == kIdImportImage && code == BN_CLICKED)
+            {
+                OnImportImage(*state);
                 return 0;
             }
             if (id == kIdList && code == LBN_DBLCLK)

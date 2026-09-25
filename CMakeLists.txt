@@ -29,9 +29,10 @@ add_executable(TracingApp WIN32
     src/graphics/OverlaySurface.cpp
     src/graphics/CapturePreview.cpp
     src/capture/CaptureSession.cpp
+    src/image/ImageLoader.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
-target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid gdi32 WindowsApp)
+target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid gdi32 WindowsApp windowscodecs ole32 uuid shell32)
 
 add_executable(TracingApp.BootstrapTests
     tests/unit/bootstrap_tests.cpp
@@ -61,6 +62,12 @@ add_executable(TracingApp.CaptureStateTests
 tracing_app_apply_first_party_options(TracingApp.CaptureStateTests)
 target_link_libraries(TracingApp.CaptureStateTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.ImageLoaderTests
+    tests/unit/ImageLoaderTests.cpp
+    src/image/ImageLoader.cpp)
+tracing_app_apply_first_party_options(TracingApp.ImageLoaderTests)
+target_link_libraries(TracingApp.ImageLoaderTests PRIVATE GTest::gtest_main windowscodecs ole32 uuid)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -72,4 +79,5 @@ add_test(NAME TracingApp.TargetSelectionTests COMMAND TracingApp.TargetSelection
 add_test(NAME TracingApp.GraphicsPolicyTests COMMAND TracingApp.GraphicsPolicyTests)
 add_test(NAME TracingApp.OverlayPolicyTests COMMAND TracingApp.OverlayPolicyTests)
 add_test(NAME TracingApp.CaptureStateTests COMMAND TracingApp.CaptureStateTests)
+add_test(NAME TracingApp.ImageLoaderTests COMMAND TracingApp.ImageLoaderTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)
