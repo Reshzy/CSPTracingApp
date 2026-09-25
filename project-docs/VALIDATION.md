@@ -1,22 +1,23 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. CSP interaction, OBS recording, and hardware acceptance testing remain NOT RUN.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. CSP interaction, OBS recording, and hardware acceptance testing remain NOT RUN.
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: no commit yet (empty `main`); Win32 control-window shell only; Debug executable `out/build/windows-debug/Debug/TracingApp.exe` (54272 bytes, 2026-09-25 16:12:23)
+- App commit/build and renderer path: HEAD `93e2402` (`feature/init`, Prompt 02 files uncommitted); Win32 control-window shell only; Debug `out/build/windows-debug/Debug/TracingApp.exe` (54272 bytes, 2026-09-25 16:22:59); Release `out/build/windows-release/Release/TracingApp.exe` (11264 bytes, 2026-09-25 16:23:24)
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). SDR/HDR NOT RECORDED
-- Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg NOT RECORDED
-- OpenCV and GoogleTest resolved versions: not introduced (Prompt 01 is dependency-free)
+- Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
+- OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
+- C++/WinRT (verify-only, not linked): SDK `10.0.26100.0` headers present at `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\cppwinrt\winrt\base.h` and `windows.graphics.capture.h`; `cppwinrt.exe` v2.0.250303.5. Windows App SDK not adopted.
 - GPU, driver, monitor sizes/refresh/DPI/origins: NVIDIA GeForce RTX 3060 driver 32.0.16.1656 at 2560x1440 (active); AMD Radeon(TM) Graphics driver 32.0.21042.62 (no current resolution reported). Refresh/DPI/origins NOT RECORDED
 - CSP version/locale/theme/workspace and drawing device: NOT RECORDED
 - OBS version, Display Capture method/settings, recording resolution/FPS: NOT RECORDED
 
 ## Milestone status
 
-- M0 reproducible shell/build/tests: PASS (Prompt 01 Debug bootstrap only: local Git, Win32 control window, Debug configure/build/test, one discovered CTest. vcpkg baseline, compiler policy, DPI manifest, and Release verify are later steps)
+- M0 reproducible shell/build/tests: PASS (Prompts 01–02: local Git, Win32 control window, vcpkg baseline, first-party `/W4` `/permissive-`, GoogleTest, Debug+Release `--fresh` configure/build/test. DPI manifest remains Prompt 04)
 - M1 CSP discovery/geometry/lifecycle: NOT RUN
 - M2 transparency/input/affinity: NOT RUN
 - M3 actual CSP capture/resize/no-feedback: NOT RUN
@@ -138,6 +139,69 @@ Known limitations / unavailable hardware:
   no DPI manifest, capture, OpenCV, or OBS
   Windows SDR/HDR, monitor refresh/DPI/origins not measured
 Blocker or next prompt: 02 — Pin dependencies and compiler policy
+```
+
+```text
+Step / milestone: 02 / M0 dependencies and compiler policy
+Date / commit: 2026-09-25 / working tree on feature/init ahead of 93e2402 (uncommitted)
+Status: PASS
+Changed files:
+  vcpkg.json (new)
+  CMakePresets.json
+  CMakeLists.txt
+  tests/unit/bootstrap_tests.cpp
+  .clang-format (new)
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  first cmake --preset windows-debug on the Prompt 01 cache: exit 1
+    find_package(GTest) failed (GTest_DIR-NOTFOUND); toolchain path was in cache but manifest install did not run
+  cmake --preset windows-debug --fresh
+  exit 0
+    Running vcpkg install; fetched registry https://github.com/microsoft/vcpkg
+    installed gtest:x64-windows@1.17.0#3, vcpkg-cmake:x64-windows@2024-04-23, vcpkg-cmake-config:x64-windows@2026-07-21
+    SDK 10.0.26100.0; CXX MSVC 19.51.36260.0; binaryDir out/build/windows-debug
+  cmake --preset windows-release --fresh
+  exit 0
+    restored the same three packages from local binary cache; binaryDir out/build/windows-release
+Build command + exit code:
+  cmake --build --preset windows-debug
+  exit 0
+    MSBuild 18.10.1-1.26427.6+3cd27c13e
+    TracingApp.exe (54272 bytes) and TracingApp.BootstrapTests.exe (110592 bytes) under out/build/windows-debug/Debug/
+  cmake --build --preset windows-release
+  exit 0
+    TracingApp.exe (11264 bytes) and TracingApp.BootstrapTests.exe (26112 bytes) under out/build/windows-release/Release/
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 1, passed 1, failed 0 (TracingApp.BootstrapTests, 0.04s)
+  direct exe --gtest_list_tests: 5 ViewportPolicy cases; --gtest_brief=1: 5 tests, all PASSED
+  ctest --preset windows-release --output-on-failure
+  exit 0
+  discovered 1, passed 1, failed 0 (TracingApp.BootstrapTests, 0.03s)
+Manual setup and exact actions:
+  confirmed VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake exists
+  confirmed SDK cppwinrt\winrt\base.h and windows.graphics.capture.h exist; cppwinrt.exe printed v2.0.250303.5
+  no CSP/OBS/pen checks in this step
+Expected / actual:
+  expected: manifest-mode GoogleTest, first-party /W4 /permissive-, Debug+Release configure/build/test, C++/WinRT headers present without Windows App SDK
+  actual: matches; stale Prompt 01 cache required --fresh before vcpkg install ran
+Evidence paths (local, no private artwork committed):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/build/windows-debug/Debug/TracingApp.BootstrapTests.exe
+  out/build/windows-release/Release/TracingApp.exe
+  out/build/windows-release/Release/TracingApp.BootstrapTests.exe
+  out/build/windows-debug/vcpkg-manifest-install.log
+Measured samples / p50 / p95 / max where applicable: n/a
+Known limitations / unavailable hardware:
+  cmake/ctest not on PATH; invoked via VS 2026 bundled binaries
+  VCPKG_ROOT must be set in the environment; no personal path is committed
+  VS bundled vcpkg is readonly / not a git checkout; baseline is the bundle embeddedsha
+  vcpkg downloaded its own CMake 4.4.0 and 7-Zip 26.02 tools into the user vcpkg downloads cache during the first install
+  DPI manifest, capture, OpenCV, overlay, and OBS remain later steps
+  Windows SDR/HDR, monitor refresh/DPI/origins not measured
+Blocker or next prompt: 03 — Target discovery
 ```
 
 ## Final acceptance

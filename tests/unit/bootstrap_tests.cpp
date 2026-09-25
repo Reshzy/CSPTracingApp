@@ -1,26 +1,28 @@
+#include <gtest/gtest.h>
+
 bool IsValidControlViewport(int width, int height) noexcept;
 
-int main()
+TEST(ViewportPolicy, RejectsZeroWidth)
 {
-    if (IsValidControlViewport(0, 480))
-    {
-        return 1;
-    }
-    if (IsValidControlViewport(640, 0))
-    {
-        return 1;
-    }
-    if (IsValidControlViewport(0, 0))
-    {
-        return 1;
-    }
-    if (IsValidControlViewport(-1, 480))
-    {
-        return 1;
-    }
-    if (!IsValidControlViewport(640, 480))
-    {
-        return 1;
-    }
-    return 0;
+    EXPECT_FALSE(IsValidControlViewport(0, 480));
+}
+
+TEST(ViewportPolicy, RejectsZeroHeight)
+{
+    EXPECT_FALSE(IsValidControlViewport(640, 0));
+}
+
+TEST(ViewportPolicy, RejectsZeroWidthAndHeight)
+{
+    EXPECT_FALSE(IsValidControlViewport(0, 0));
+}
+
+TEST(ViewportPolicy, RejectsNegativeWidth)
+{
+    EXPECT_FALSE(IsValidControlViewport(-1, 480));
+}
+
+TEST(ViewportPolicy, AcceptsPositiveDimensions)
+{
+    EXPECT_TRUE(IsValidControlViewport(640, 480));
 }
