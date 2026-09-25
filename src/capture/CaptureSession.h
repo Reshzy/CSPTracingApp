@@ -70,6 +70,19 @@ struct FramePacket
     bool stale = false;
 };
 
+// Capture-space canvas ROI. Conversion from client-relative pixels happens
+// in the app using measured capture-to-client mapping. Ints only; this header
+// does not include RoiReadback.h.
+struct CanvasRoiRequest
+{
+    bool applied = false;
+    bool mappingValidated = false;
+    int captureX = 0;
+    int captureY = 0;
+    int captureW = 0;
+    int captureH = 0;
+};
+
 // GPU-free lifecycle and bounded handoff policy. Missing WGC support is
 // Unsupported, never Failed. Sequence increments only on accepted frames.
 class CaptureSessionPolicy
@@ -134,6 +147,7 @@ public:
     void OnItemClosed();
     void PumpHandoff();
     void NoteGeometryGeneration(std::uint64_t geometryGeneration) noexcept;
+    void SetCanvasRoiRequest(CanvasRoiRequest const& request) noexcept;
 
     CaptureSessionState State() const noexcept;
     FramePacket LastPacket() const;

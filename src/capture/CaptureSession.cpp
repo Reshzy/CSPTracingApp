@@ -124,6 +124,8 @@ struct CaptureSession::Impl
     HRESULT lastRecreateHr = S_OK;
     RoiReadback roiReadback;
     std::wstring roiReport{L"roi (none)"};
+    std::wstring roiSrc{L"full-content-fallback"};
+    CanvasRoiRequest canvasRoi{};
 
     void OnFrameArrived(wgc::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&);
     void OnClosed(wgc::GraphicsCaptureItem const&, winrt::Windows::Foundation::IInspectable const&);
@@ -224,6 +226,8 @@ void CaptureSession::Impl::TeardownResources() noexcept
 
     roiReadback.Release();
     roiReport = L"roi (none)";
+    roiSrc = L"full-content-fallback";
+    canvasRoi = {};
 
     ownedTexture.Reset();
     ownedWidth = 0;
@@ -716,19 +720,36 @@ void CaptureSession::PumpHandoff()
     bool const copied = impl_->CopyOwned(latest, copyHr, copyError);
 
     std::wstring roiError;
+    std::wstring lastRoiSrc;
+    bool haveRoiSrc = false;
     if (copied && impl_->ownedTexture)
     {
         graphics::DeviceResources* gpu = nullptr;
+        CanvasRoiRequest roiRequest{};
         {
             std::lock_guard<std::mutex> const lock(impl_->mutex);
             gpu = impl_->device;
+            roiRequest = impl_->canvasRoi;
         }
         if (gpu != nullptr && gpu->IsReady() && gpu->Device() != nullptr &&
             gpu->ImmediateContext() != nullptr)
         {
             RoiPixelRect requested{};
-            requested.w = static_cast<int>(impl_->ownedWidth);
-            requested.h = static_cast<int>(impl_->ownedHeight);
+            std::wstring roiSrc = L"full-content-fallback";
+            if (roiRequest.applied && roiRequest.mappingValidated && roiRequest.captureW > 0 &&
+                roiRequest.captureH > 0)
+            {
+                requested.x = roiRequest.captureX;
+                requested.y = roiRequest.captureY;
+                requested.w = roiRequest.captureW;
+                requested.h = roiRequest.captureH;
+                roiSrc = L"applied-mapped";
+            }
+            else
+            {
+                requested.w = static_cast<int>(impl_->ownedWidth);
+                requested.h = static_cast<int>(impl_->ownedHeight);
+            }
             int const downsample = DefaultRoiDownsample(requested.w, requested.h);
             RoiBufferMeta meta{};
             meta.sequence = latest.packet.sequence;
@@ -746,6 +767,8 @@ void CaptureSession::PumpHandoff()
                 meta,
                 roiError);
             impl_->roiReadback.TryComplete(gpu->ImmediateContext(), roiError);
+            lastRoiSrc = std::move(roiSrc);
+            haveRoiSrc = true;
         }
     }
 
@@ -762,6 +785,10 @@ void CaptureSession::PumpHandoff()
         impl_->lastHr = copied ? recreateHr : copyHr;
         impl_->lastRecreateHr = recreateHr;
         impl_->roiReport = impl_->roiReadback.FormatReport();
+        if (haveRoiSrc)
+        {
+            impl_->roiSrc = std::move(lastRoiSrc);
+        }
         if (copied)
         {
             impl_->lastPacket = latest.packet;
@@ -819,6 +846,16 @@ void CaptureSession::NoteGeometryGeneration(std::uint64_t geometryGeneration) no
     impl_->geometryGeneration = geometryGeneration;
 }
 
+void CaptureSession::SetCanvasRoiRequest(CanvasRoiRequest const& request) noexcept
+{
+    if (!impl_)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    impl_->canvasRoi = request;
+}
+
 ID3D11Texture2D* CaptureSession::BorrowOwnedTexture() const noexcept
 {
     if (!impl_)
@@ -850,6 +887,7 @@ std::wstring CaptureSession::FormatReport() const
     std::uint64_t recreateCount = 0;
     HRESULT lastRecreateHr = S_OK;
     std::wstring roiReport;
+    std::wstring roiSrc;
     {
         std::lock_guard<std::mutex> const lock(impl_->mutex);
         policySnapshot = impl_->policy;
@@ -866,6 +904,7 @@ std::wstring CaptureSession::FormatReport() const
         recreateCount = impl_->recreateCount;
         lastRecreateHr = impl_->lastRecreateHr;
         roiReport = impl_->roiReport;
+        roiSrc = impl_->roiSrc;
     }
 
     std::wstring supportText = L"unchecked";
@@ -890,7 +929,7 @@ std::wstring CaptureSession::FormatReport() const
            L" ownedFrame=" + (hasOwned ? L"yes" : L"no") + L" lastHr=" + FormatHresult(lastHr) +
            L"\r\n" + L"poolSize=" + std::to_wstring(poolWidth) + L"x" + std::to_wstring(poolHeight) +
            L" recreates=" + std::to_wstring(recreateCount) + L" recreateHr=" +
-           FormatHresult(lastRecreateHr) + L"\r\n" + roiReport +
+           FormatHresult(lastRecreateHr) + L"\r\n" + roiReport + L" roiSrc=" + roiSrc +
            L" (WGC copies owned textures; ROI CPU buffer is a packed copy, not zero-copy)";
 }
 

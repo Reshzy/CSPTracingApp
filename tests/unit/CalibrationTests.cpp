@@ -43,6 +43,8 @@ using tracing::core::TryAxisAlignedOverlayPlacement;
 using tracing::core::TryMakeCaptureToScreen;
 using tracing::core::TryMapCaptureToClient;
 using tracing::core::TryMapCaptureToScreen;
+using tracing::core::TryMapClientRoiToCapture;
+using tracing::core::TryMapClientToCapture;
 using tracing::core::TryValidateCanvasRoi;
 using tracing::core::Vec2;
 
@@ -139,6 +141,10 @@ TEST(CalibrationMapping, CaptureToClientToScreenWithNegativeOrigin)
     ASSERT_TRUE(mCs.has_value());
     EXPECT_EQ(mCs->from, Space::C);
     EXPECT_EQ(mCs->to, Space::S);
+
+    std::optional<Vec2> const back = TryMapClientToCapture(input, *client);
+    ASSERT_TRUE(back.has_value());
+    ExpectVecNear(*back, 10.0, 20.0);
 }
 
 TEST(CalibrationMapping, RejectsUnmatchedAndZeroContent)
@@ -158,6 +164,49 @@ TEST(CalibrationMapping, RejectsUnmatchedAndZeroContent)
     input.contentWidth = 0.0;
     EXPECT_FALSE(CaptureMappingIsValidated(input));
     EXPECT_FALSE(TryMapCaptureToClient(input, Vec2{1.0, 1.0}).has_value());
+    EXPECT_FALSE(TryMapClientToCapture(input, Vec2{1.0, 1.0}).has_value());
+    EXPECT_FALSE(TryMapClientRoiToCapture(input, Rect2{80.0, 80.0, 640.0, 480.0}).has_value());
+}
+
+TEST(CalibrationMapping, ClientRoiToCaptureUsesMeasuredOffset)
+{
+    CaptureMappingInput input{};
+    input.contentWidth = 1920.0;
+    input.contentHeight = 1080.0;
+    input.clientOriginS = Vec2{-1920.0, 108.0};
+    input.clientWidth = 1912.0;
+    input.clientHeight = 1049.0;
+    input.captureToClient = Vec2{8.0, 31.0};
+    input.match = CaptureMappingMatch::OuterWindow;
+
+    std::optional<Rect2> const capture =
+        TryMapClientRoiToCapture(input, Rect2{80.0, 80.0, 640.0, 480.0});
+    ASSERT_TRUE(capture.has_value());
+    EXPECT_DOUBLE_EQ(capture->x, 88.0);
+    EXPECT_DOUBLE_EQ(capture->y, 111.0);
+    EXPECT_DOUBLE_EQ(capture->width, 640.0);
+    EXPECT_DOUBLE_EQ(capture->height, 480.0);
+
+    std::optional<Vec2> const clientOrigin = TryMapCaptureToClient(input, Vec2{capture->x, capture->y});
+    ASSERT_TRUE(clientOrigin.has_value());
+    ExpectVecNear(*clientOrigin, 80.0, 80.0);
+}
+
+TEST(CalibrationMapping, ClientRoiRejectsUnvalidatedAndNonPositive)
+{
+    CaptureMappingInput input{};
+    input.contentWidth = 1920.0;
+    input.contentHeight = 1080.0;
+    input.clientOriginS = Vec2{10.0, 20.0};
+    input.clientWidth = 800.0;
+    input.clientHeight = 600.0;
+    input.captureToClient = Vec2{8.0, 31.0};
+    input.match = CaptureMappingMatch::None;
+    EXPECT_FALSE(TryMapClientRoiToCapture(input, Rect2{80.0, 80.0, 640.0, 480.0}).has_value());
+
+    input.match = CaptureMappingMatch::OuterWindow;
+    EXPECT_FALSE(TryMapClientRoiToCapture(input, Rect2{80.0, 80.0, 0.0, 480.0}).has_value());
+    EXPECT_FALSE(TryMapClientRoiToCapture(input, Rect2{80.0, 80.0, 640.0, -1.0}).has_value());
 }
 
 TEST(CalibrationUnits, DistinguishesLocalFromDeclaredDocumentPixels)

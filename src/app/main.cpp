@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <commctrl.h>
 
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -226,17 +227,60 @@ tracing::core::CaptureMappingInput CoreMappingFromState(ControlState const& stat
     return input;
 }
 
+bool CalibrationIsLive(ControlState const& state) noexcept
+{
+    return state.calibration.roiApplied &&
+           state.calibration.lastInvalidation == tracing::core::CalibrationInvalidation::None;
+}
+
+bool TryRoundCaptureRoi(tracing::core::Rect2 const& roi, tracing::capture::CanvasRoiRequest& request)
+{
+    if (!std::isfinite(roi.x) || !std::isfinite(roi.y) || !std::isfinite(roi.width) ||
+        !std::isfinite(roi.height))
+    {
+        return false;
+    }
+
+    long long const x = std::llround(roi.x);
+    long long const y = std::llround(roi.y);
+    long long const w = std::llround(roi.width);
+    long long const h = std::llround(roi.height);
+    if (w <= 0 || h <= 0 || x < INT_MIN || x > INT_MAX || y < INT_MIN || y > INT_MAX ||
+        w > INT_MAX || h > INT_MAX)
+    {
+        return false;
+    }
+
+    request.captureX = static_cast<int>(x);
+    request.captureY = static_cast<int>(y);
+    request.captureW = static_cast<int>(w);
+    request.captureH = static_cast<int>(h);
+    return true;
+}
+
+void SyncCanvasRoiRequest(ControlState& state)
+{
+    tracing::capture::CanvasRoiRequest request{};
+    tracing::core::CaptureMappingInput const mapping = CoreMappingFromState(state);
+    if (CalibrationIsLive(state) && tracing::core::CaptureMappingIsValidated(mapping))
+    {
+        std::optional<tracing::core::Rect2> const captureRoi =
+            tracing::core::TryMapClientRoiToCapture(mapping, state.calibration.roi);
+        if (captureRoi.has_value() && TryRoundCaptureRoi(*captureRoi, request))
+        {
+            request.applied = true;
+            request.mappingValidated = true;
+        }
+    }
+    state.capture.SetCanvasRoiRequest(request);
+}
+
 void ResetLiveCalibration(ControlState& state)
 {
     state.calibration = LiveCalibration{};
     state.calibration.mRd = tracing::core::ResetReferenceAlignment();
     state.calibration.zoom = 1.0;
-}
-
-bool CalibrationIsLive(ControlState const& state) noexcept
-{
-    return state.calibration.roiApplied &&
-           state.calibration.lastInvalidation == tracing::core::CalibrationInvalidation::None;
+    SyncCanvasRoiRequest(state);
 }
 
 bool ReadEditDouble(HWND edit, double& value, bool allowEmpty, double emptyValue)
@@ -447,6 +491,7 @@ void SetStatus(ControlState& state, std::wstring const& text)
 void StopCapture(ControlState& state)
 {
     state.capture.Stop();
+    SyncCanvasRoiRequest(state);
     if (state.preview.IsEnabled())
     {
         std::wstring error;
@@ -624,6 +669,7 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
     state.lastGeometry = sampled;
     RefreshCalibrationValidity(state);
     state.capture.NoteGeometryGeneration(sampled.geometryGeneration);
+    SyncCanvasRoiRequest(state);
     std::wstring body = tracing::platform::FormatGeometryReport(sampled);
     if (!extra.empty())
     {
@@ -1234,6 +1280,7 @@ void OnApplyRoi(ControlState& state)
     state.calibration.declaredDocH = declaredH;
     state.calibration.lastInvalidation = tracing::core::CalibrationInvalidation::None;
     ApplyDerivedImagePlacement(state);
+    SyncCanvasRoiRequest(state);
     SetStatusWithOverlay(
         state,
         L"Applied canvas ROI in client-relative pixels. Overlay HWND clipped to ROI. "
@@ -1385,6 +1432,7 @@ void StartCaptureNow(ControlState& state)
         return;
     }
     state.hideOverlayOnCaptureLoss = false;
+    SyncCanvasRoiRequest(state);
     RefreshGeometryDisplay(
         state,
         L"WGC capture started (owned frames; preview off by default). Overlay test-pattern "
@@ -2067,6 +2115,8 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 RefreshGeometryDisplay(*state, L"WGC item Closed; session torn down; tracing overlay hidden.");
                 return 0;
             }
+            RefreshCalibrationValidity(*state);
+            SyncCanvasRoiRequest(*state);
             state->capture.PumpHandoff();
             tracing::capture::FramePacket const packet = state->capture.LastPacket();
             if (packet.stale)
