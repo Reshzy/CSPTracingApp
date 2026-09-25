@@ -36,6 +36,27 @@ enum class OverlayObsVerification
     NotRun,
 };
 
+enum class OverlayInteractionMode
+{
+    Tracing,
+    Alignment,
+};
+
+inline LRESULT OverlayHitTestCode(OverlayInteractionMode mode) noexcept
+{
+    return mode == OverlayInteractionMode::Alignment ? HTCLIENT : HTTRANSPARENT;
+}
+
+inline bool OverlayUsesTransparentExStyle(OverlayInteractionMode mode) noexcept
+{
+    return mode == OverlayInteractionMode::Tracing;
+}
+
+inline std::wstring FormatOverlayInteractionMode(OverlayInteractionMode mode)
+{
+    return mode == OverlayInteractionMode::Alignment ? L"alignment" : L"tracing";
+}
+
 struct OverlayVisibilityInput
 {
     bool targetUsable = false;
@@ -171,7 +192,9 @@ public:
     void EmergencyHide();
     void ClearEmergencyHide() noexcept;
     void RequestTestPattern();
+    void RequestTestPatternAt(OverlayPlacement const& placement);
     void ClearTestPattern() noexcept;
+    void SetInteractionMode(OverlayInteractionMode mode);
     void UpdatePlacementAndVisibility(
         OverlayPlacement const& placement,
         bool targetUsable,
@@ -189,18 +212,25 @@ public:
     OverlayObsVerification ObsVerification() const noexcept;
     OverlayVisibilityResult LastVisibility() const noexcept;
     OverlayPlacement const& LastPlacement() const noexcept;
+    OverlayInteractionMode InteractionMode() const noexcept;
+    unsigned ConsumedMouseDown() const noexcept;
+    unsigned ConsumedWheel() const noexcept;
+    unsigned ConsumedPointerDown() const noexcept;
     std::wstring FormatReport() const;
 
 private:
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     bool RegisterOverlayClass(HINSTANCE instance, std::wstring& error);
     bool CreateOverlayWindow(HINSTANCE instance, std::wstring& error);
     bool CreateComposition(std::wstring& error);
     bool ApplyExcludeFromCapture();
+    bool ApplyHitTestStyles();
     bool EnsureSwapChainSize(unsigned width, unsigned height, std::wstring& error);
     bool BindBackBuffer(std::wstring& error);
     bool DrawMarker(std::wstring& error);
     void HideWindowOnly();
     OverlayPlacement TestPatternPlacement() const;
+    LONG_PTR CurrentExStyle() const noexcept;
 
     DeviceResources* device_ = nullptr;
     HWND controlWindow_ = nullptr;
@@ -220,6 +250,11 @@ private:
     bool emergencyHidden_ = false;
     bool testPatternActive_ = false;
     bool visible_ = false;
+    bool topmostWhileShown_ = false;
+    OverlayInteractionMode mode_ = OverlayInteractionMode::Tracing;
+    unsigned consumedMouseDown_ = 0;
+    unsigned consumedWheel_ = 0;
+    unsigned consumedPointerDown_ = 0;
     std::wstring lastError_;
 };
 
@@ -266,6 +301,26 @@ inline OverlayVisibilityResult OverlaySurface::LastVisibility() const noexcept
 inline OverlayPlacement const& OverlaySurface::LastPlacement() const noexcept
 {
     return lastPlacement_;
+}
+
+inline OverlayInteractionMode OverlaySurface::InteractionMode() const noexcept
+{
+    return mode_;
+}
+
+inline unsigned OverlaySurface::ConsumedMouseDown() const noexcept
+{
+    return consumedMouseDown_;
+}
+
+inline unsigned OverlaySurface::ConsumedWheel() const noexcept
+{
+    return consumedWheel_;
+}
+
+inline unsigned OverlaySurface::ConsumedPointerDown() const noexcept
+{
+    return consumedPointerDown_;
 }
 
 inline void OverlaySurface::ClearEmergencyHide() noexcept

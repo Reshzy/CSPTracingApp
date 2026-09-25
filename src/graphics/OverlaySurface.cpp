@@ -46,24 +46,13 @@ std::wstring FormatHex32(unsigned long value)
     return buffer;
 }
 
-LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+#ifndef WM_POINTERDOWN
+#define WM_POINTERDOWN 0x0246
+#endif
+
+OverlaySurface* SurfaceFromHwnd(HWND hwnd) noexcept
 {
-    switch (message)
-    {
-    case WM_MOUSEACTIVATE:
-        return MA_NOACTIVATE;
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_PAINT:
-    {
-        PAINTSTRUCT paint{};
-        BeginPaint(hwnd, &paint);
-        EndPaint(hwnd, &paint);
-        return 0;
-    }
-    default:
-        return DefWindowProcW(hwnd, message, wParam, lParam);
-    }
+    return reinterpret_cast<OverlaySurface*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 }
 
 bool ClipRect(D3D11_RECT& rect, unsigned destWidth, unsigned destHeight) noexcept
@@ -150,6 +139,11 @@ void OverlaySurface::Release()
     lastPlacement_ = {};
     emergencyHidden_ = false;
     testPatternActive_ = false;
+    topmostWhileShown_ = false;
+    mode_ = OverlayInteractionMode::Tracing;
+    consumedMouseDown_ = 0;
+    consumedWheel_ = 0;
+    consumedPointerDown_ = 0;
 }
 
 void OverlaySurface::EmergencyHide()
@@ -163,14 +157,43 @@ void OverlaySurface::EmergencyHide()
 
 void OverlaySurface::RequestTestPattern()
 {
+    RequestTestPatternAt(TestPatternPlacement());
+}
+
+void OverlaySurface::RequestTestPatternAt(OverlayPlacement const& placement)
+{
     emergencyHidden_ = false;
     testPatternActive_ = true;
-    OverlayPlacement const placement = TestPatternPlacement();
     std::wstring error;
     UpdatePlacementAndVisibility(placement, false, false, true, false, error);
     if (!error.empty())
     {
         lastError_ = error;
+    }
+}
+
+void OverlaySurface::SetInteractionMode(OverlayInteractionMode mode)
+{
+    if (mode_ == mode)
+    {
+        return;
+    }
+    mode_ = mode;
+    if (mode_ == OverlayInteractionMode::Tracing)
+    {
+        consumedMouseDown_ = 0;
+        consumedWheel_ = 0;
+        consumedPointerDown_ = 0;
+    }
+    ApplyHitTestStyles();
+    if (visible_ && contentReady_)
+    {
+        std::wstring error;
+        DrawMarker(error);
+        if (!error.empty())
+        {
+            lastError_ = error;
+        }
     }
 }
 
@@ -227,12 +250,13 @@ void OverlaySurface::UpdatePlacementAndVisibility(
 
     SetWindowPos(
         hwnd_,
-        HWND_TOP,
+        HWND_TOPMOST,
         lastPlacement_.x,
         lastPlacement_.y,
         lastPlacement_.width,
         lastPlacement_.height,
         SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    topmostWhileShown_ = true;
     visible_ = true;
     lastError_.clear();
 }
@@ -269,6 +293,26 @@ std::wstring OverlaySurface::FormatReport() const
     text += emergencyHidden_ ? L"yes" : L"no";
     text += L" testPattern=";
     text += testPatternActive_ ? L"yes" : L"no";
+    LONG_PTR const ex = CurrentExStyle();
+    text += L"\r\ninteraction=";
+    text += FormatOverlayInteractionMode(mode_);
+    text += L" exstyle transparent=";
+    text += (ex & WS_EX_TRANSPARENT) != 0 ? L"yes" : L"no";
+    text += L" noactivate=";
+    text += (ex & WS_EX_NOACTIVATE) != 0 ? L"yes" : L"no";
+    text += L" noredirectionbitmap=";
+    text += (ex & WS_EX_NOREDIRECTIONBITMAP) != 0 ? L"yes" : L"no";
+    text += L" layered=";
+    text += (ex & WS_EX_LAYERED) != 0 ? L"yes" : L"no";
+    text += L"\r\nzOrder=";
+    text += topmostWhileShown_ && visible_ ? L"topmost-while-shown" : L"not-topmost";
+    text += L" consumed mouseDown=";
+    text += std::to_wstring(consumedMouseDown_);
+    text += L" wheel=";
+    text += std::to_wstring(consumedWheel_);
+    text += L" pointerDown=";
+    text += std::to_wstring(consumedPointerDown_);
+    text += L" (tracing should stay 0 if pass-through works)";
     text += L"\r\nplacement origin=(";
     text += std::to_wstring(lastPlacement_.x);
     text += L",";
@@ -292,7 +336,7 @@ bool OverlaySurface::RegisterOverlayClass(HINSTANCE instance, std::wstring& erro
 {
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
-    windowClass.lpfnWndProc = OverlayWndProc;
+    windowClass.lpfnWndProc = OverlaySurface::WndProc;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     windowClass.hbrBackground = nullptr;
@@ -312,8 +356,10 @@ bool OverlaySurface::RegisterOverlayClass(HINSTANCE instance, std::wstring& erro
 
 bool OverlaySurface::CreateOverlayWindow(HINSTANCE instance, std::wstring& error)
 {
+    DWORD const exStyle = WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP |
+                          (OverlayUsesTransparentExStyle(mode_) ? WS_EX_TRANSPARENT : 0);
     hwnd_ = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
+        exStyle,
         kOverlayClass,
         L"TracingAppOverlay",
         WS_POPUP,
@@ -324,14 +370,105 @@ bool OverlaySurface::CreateOverlayWindow(HINSTANCE instance, std::wstring& error
         nullptr,
         nullptr,
         instance,
-        nullptr);
+        this);
     if (hwnd_ == nullptr)
     {
         unsigned long const code = GetLastError();
         error = L"CreateWindowExW overlay failed (Win32 " + std::to_wstring(code) + L").";
         return false;
     }
+    return ApplyHitTestStyles();
+}
+
+bool OverlaySurface::ApplyHitTestStyles()
+{
+    if (hwnd_ == nullptr)
+    {
+        return false;
+    }
+
+    LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    if (OverlayUsesTransparentExStyle(mode_))
+    {
+        ex |= WS_EX_TRANSPARENT;
+    }
+    else
+    {
+        ex &= ~static_cast<LONG_PTR>(WS_EX_TRANSPARENT);
+    }
+    SetWindowLongPtrW(hwnd_, GWL_EXSTYLE, ex);
+    SetWindowPos(
+        hwnd_,
+        nullptr,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     return true;
+}
+
+LONG_PTR OverlaySurface::CurrentExStyle() const noexcept
+{
+    if (hwnd_ == nullptr)
+    {
+        return 0;
+    }
+    return GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+}
+
+LRESULT CALLBACK OverlaySurface::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_NCCREATE)
+    {
+        auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        auto* surface = static_cast<OverlaySurface*>(create->lpCreateParams);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(surface));
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
+
+    auto* surface = SurfaceFromHwnd(hwnd);
+    switch (message)
+    {
+    case WM_NCDESTROY:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    case WM_NCHITTEST:
+        return OverlayHitTestCode(
+            surface != nullptr ? surface->mode_ : OverlayInteractionMode::Tracing);
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_LBUTTONDOWN:
+        if (surface != nullptr)
+        {
+            ++surface->consumedMouseDown_;
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        if (surface != nullptr)
+        {
+            ++surface->consumedWheel_;
+        }
+        return 0;
+    case WM_POINTERDOWN:
+        if (surface != nullptr)
+        {
+            ++surface->consumedPointerDown_;
+        }
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+    {
+        PAINTSTRUCT paint{};
+        BeginPaint(hwnd, &paint);
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    default:
+        return DefWindowProcW(hwnd, message, wParam, lParam);
+    }
 }
 
 bool OverlaySurface::CreateComposition(std::wstring& error)
@@ -517,6 +654,16 @@ bool OverlaySurface::DrawMarker(std::wstring& error)
     float const clear[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     context1->ClearRenderTargetView(rtv_.Get(), clear);
 
+    if (mode_ == OverlayInteractionMode::Alignment)
+    {
+        D3D11_RECT strip{0, 0, static_cast<LONG>(swapWidth_), 8};
+        if (ClipRect(strip, swapWidth_, swapHeight_))
+        {
+            float const cyan[4] = {0.0f, 1.0f, 1.0f, 1.0f};
+            context1->ClearView(rtv_.Get(), cyan, &strip, 1);
+        }
+    }
+
     D3D11_RECT magentaRect{
         static_cast<LONG>(kMagentaX),
         static_cast<LONG>(kMagentaY),
@@ -556,13 +703,14 @@ void OverlaySurface::HideWindowOnly()
     {
         SetWindowPos(
             hwnd_,
-            nullptr,
+            HWND_NOTOPMOST,
             0,
             0,
             0,
             0,
-            SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+            SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
+    topmostWhileShown_ = false;
     visible_ = false;
 }
 

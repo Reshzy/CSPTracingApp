@@ -54,8 +54,14 @@ add_executable(TracingApp.OverlayPolicyTests
 tracing_app_apply_first_party_options(TracingApp.OverlayPolicyTests)
 target_link_libraries(TracingApp.OverlayPolicyTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.InputProbe WIN32
+    tests/harness/InputProbe.cpp
+    resources/app.manifest)
+tracing_app_apply_first_party_options(TracingApp.InputProbe)
+
 enable_testing()
 add_test(NAME TracingApp.BootstrapTests COMMAND TracingApp.BootstrapTests)
 add_test(NAME TracingApp.TargetSelectionTests COMMAND TracingApp.TargetSelectionTests)
 add_test(NAME TracingApp.GraphicsPolicyTests COMMAND TracingApp.GraphicsPolicyTests)
 add_test(NAME TracingApp.OverlayPolicyTests COMMAND TracingApp.OverlayPolicyTests)
+add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)

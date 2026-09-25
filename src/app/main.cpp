@@ -23,7 +23,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 
 namespace {
 constexpr int kDefaultWidth = 720;
-constexpr int kDefaultHeight = 760;
+constexpr int kDefaultHeight = 800;
 constexpr wchar_t kWindowClass[] = L"TracingAppControlWindow";
 constexpr wchar_t kWindowTitle[] = L"TracingApp";
 constexpr int kIdList = 1001;
@@ -32,6 +32,9 @@ constexpr int kIdSelect = 1003;
 constexpr int kIdStatus = 1004;
 constexpr int kIdEmergencyHide = 1005;
 constexpr int kIdShowMarker = 1006;
+constexpr int kIdTracingMode = 1007;
+constexpr int kIdAlignmentMode = 1008;
+constexpr int kIdCoverProbe = 1009;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT_PTR kTimerGeometry = 1;
 constexpr UINT kGeometryPollMs = 250;
@@ -366,6 +369,68 @@ void OnShowTestMarker(ControlState& state)
         L"Show test marker: using selected target client physical bounds.");
 }
 
+void OnTracingMode(ControlState& state)
+{
+    state.overlay.SetInteractionMode(tracing::graphics::OverlayInteractionMode::Tracing);
+    SetStatusWithOverlay(
+        state,
+        L"Interaction mode: tracing (noninteractive pass-through).");
+}
+
+void OnAlignmentMode(ControlState& state)
+{
+    state.overlay.SetInteractionMode(tracing::graphics::OverlayInteractionMode::Alignment);
+    SetStatusWithOverlay(
+        state,
+        L"Interaction mode: alignment (overlay accepts input).");
+}
+
+void OnCoverInputProbe(ControlState& state)
+{
+    HWND const probe = FindWindowW(L"TracingAppInputProbe", nullptr);
+    if (probe == nullptr)
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Input probe not running. Start TracingApp.InputProbe.exe first.");
+        return;
+    }
+
+    RECT client{};
+    if (GetClientRect(probe, &client) == FALSE || client.right <= client.left ||
+        client.bottom <= client.top)
+    {
+        SetStatusWithOverlay(state, L"Input probe client rect is empty.");
+        return;
+    }
+
+    POINT origin{client.left, client.top};
+    if (ClientToScreen(probe, &origin) == FALSE)
+    {
+        SetStatusWithOverlay(state, L"ClientToScreen failed for input probe.");
+        return;
+    }
+
+    StopWatching(state);
+    state.selected.reset();
+    state.overlay.ClearEmergencyHide();
+
+    tracing::graphics::OverlayPlacement placement{};
+    placement.x = origin.x;
+    placement.y = origin.y;
+    placement.width = client.right - client.left;
+    placement.height = client.bottom - client.top;
+    state.overlay.RequestTestPatternAt(placement);
+
+    DWORD probePid = 0;
+    GetWindowThreadProcessId(probe, &probePid);
+    SetStatusWithOverlay(
+        state,
+        L"Cover input probe: test-pattern over TracingAppInputProbe PID " +
+            std::to_wstring(probePid) +
+            L" (different process; not a CSP target).");
+}
+
 LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
     auto* state = reinterpret_cast<ControlState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -397,9 +462,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            256,
+            288,
             680,
-            460,
+            430,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -456,6 +521,45 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShowMarker)),
             instance,
             nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Tracing mode",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            12,
+            252,
+            130,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdTracingMode)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Alignment mode",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            150,
+            252,
+            140,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdAlignmentMode)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Cover input probe",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            298,
+            252,
+            160,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdCoverProbe)),
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -497,6 +601,21 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdShowMarker && code == BN_CLICKED)
             {
                 OnShowTestMarker(*state);
+                return 0;
+            }
+            if (id == kIdTracingMode && code == BN_CLICKED)
+            {
+                OnTracingMode(*state);
+                return 0;
+            }
+            if (id == kIdAlignmentMode && code == BN_CLICKED)
+            {
+                OnAlignmentMode(*state);
+                return 0;
+            }
+            if (id == kIdCoverProbe && code == BN_CLICKED)
+            {
+                OnCoverInputProbe(*state);
                 return 0;
             }
             if (id == kIdList && code == LBN_DBLCLK)
