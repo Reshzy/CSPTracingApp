@@ -3,6 +3,7 @@
 #endif
 
 #include <windows.h>
+#include <commctrl.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -26,10 +27,12 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "capture/CaptureSession.h"
 #include "graphics/CapturePreview.h"
 #include "graphics/DeviceResources.h"
+#include "graphics/ImageRenderer.h"
 #include "graphics/OverlaySurface.h"
 #include "image/ImageLoader.h"
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
+#include "app/ReferenceWindow.h"
 
 namespace {
 constexpr int kDefaultWidth = 720;
@@ -49,6 +52,10 @@ constexpr int kIdStartCapture = 1010;
 constexpr int kIdStopCapture = 1011;
 constexpr int kIdEnablePreview = 1012;
 constexpr int kIdImportImage = 1013;
+constexpr int kIdOpacity = 1014;
+constexpr int kIdFit = 1015;
+constexpr int kIdResetPlacement = 1016;
+constexpr int kIdShowReference = 1017;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -70,7 +77,10 @@ struct ControlState
     tracing::graphics::CapturePreview preview;
     tracing::capture::CaptureSession capture;
     tracing::image::LoadedImageSlot image;
+    tracing::graphics::ImageRenderer renderer;
+    tracing::app::ReferenceWindow reference;
     HWND previewCheck = nullptr;
+    HWND opacityTrack = nullptr;
     bool hideOverlayOnCaptureLoss = false;
     std::uint64_t nextGeneration = 1;
 };
@@ -151,6 +161,8 @@ std::wstring StatusHeader(ControlState const& state)
            state.preview.FormatReport() + L"\r\n" +
            tracing::graphics::FormatCaptureToClientMapping(MappingFromState(state)) + L"\r\n" +
            state.image.FormatReport() + L"\r\n" +
+           state.renderer.FormatReport() + L"\r\n" +
+           state.reference.FormatReport() + L"\r\n" +
            L"overlayHiddenOnCaptureLoss=" +
            std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") + L"\r\n";
 }
@@ -200,8 +212,11 @@ void SyncOverlayFromState(ControlState& state)
     bool targetUsable = false;
     bool targetForeground = false;
     bool const hasTarget = state.selected.has_value();
-    bool const controlForeground =
-        state.control != nullptr && GetForegroundWindow() == state.control;
+    HWND const foreground = GetForegroundWindow();
+    bool const controlForeground = tracing::app::OverlayOwnerIsForeground(
+        foreground,
+        state.control,
+        state.reference.Handle());
 
     if (hasTarget)
     {
@@ -233,6 +248,29 @@ void SyncOverlayFromState(ControlState& state)
         controlForeground,
         hasTarget,
         error);
+    if (state.overlay.IsVisible() && state.renderer.HasTexture())
+    {
+        std::wstring presentError;
+        if (!state.renderer.DrawAndPresent(
+                state.overlay.Handle(),
+                state.overlay.LastPlacement(),
+                state.overlay.InteractionMode(),
+                presentError) &&
+            !presentError.empty())
+        {
+            OutputDebugStringW(presentError.c_str());
+            OutputDebugStringW(L"\r\n");
+        }
+    }
+    if (state.reference.IsVisible() && state.renderer.HasTexture())
+    {
+        std::wstring referenceError;
+        if (!state.reference.Present(state.renderer, referenceError) && !referenceError.empty())
+        {
+            OutputDebugStringW(referenceError.c_str());
+            OutputDebugStringW(L"\r\n");
+        }
+    }
 }
 
 void SetStatusWithOverlay(ControlState& state, std::wstring const& body)
@@ -481,7 +519,7 @@ void OnShowTestMarker(ControlState& state)
         state.overlay.RequestTestPattern();
         SetStatusWithOverlay(
             state,
-            L"Show test marker: test-pattern surface (not imported image).");
+            L"Show test marker: test-pattern surface (image renderer overwrites if uploaded).");
         return;
     }
     state.overlay.ClearTestPattern();
@@ -615,14 +653,128 @@ void OnImportImage(ControlState& state)
     std::wstring error;
     if (state.image.TryLoad(path, error))
     {
+        std::wstring uploadError;
+        if (state.image.Image() == nullptr || !state.renderer.Upload(*state.image.Image(), uploadError))
+        {
+            SetStatusWithOverlay(
+                state,
+                L"Imported CPU image; GPU upload failed; previous GPU texture preserved.\r\n" +
+                    uploadError);
+            return;
+        }
+
+        tracing::graphics::OverlayPlacement const overlay = state.overlay.LastPlacement();
+        if (overlay.width > 0 && overlay.height > 0)
+        {
+            state.renderer.SetPlacement(tracing::graphics::FitPlacement(
+                static_cast<double>(state.renderer.TextureWidth()),
+                static_cast<double>(state.renderer.TextureHeight()),
+                static_cast<double>(overlay.width),
+                static_cast<double>(overlay.height)));
+        }
+        else
+        {
+            state.renderer.SetPlacement(tracing::graphics::ResetPlacement());
+        }
+        std::wstring referenceNote;
+        if (state.renderer.HasTexture())
+        {
+            std::wstring showError;
+            if (!state.reference.Show(state.renderer, showError))
+            {
+                referenceNote = L"\r\nReference window not shown: " + showError;
+            }
+            else
+            {
+                referenceNote =
+                    L"\r\nOrdinary reference shown (WDA_NONE; independent fit; capture preview still off).";
+            }
+        }
         SetStatusWithOverlay(
             state,
-            L"Imported image (WIC decode only; overlay still test-pattern, not uploaded).");
+            L"Imported image uploaded once (immutable texture; fit/reset/opacity do not re-upload)." +
+                referenceNote);
         return;
     }
     SetStatusWithOverlay(
         state,
         L"Import failed; previous image preserved.\r\n" + error);
+}
+
+void SyncOpacityFromTrack(ControlState& state)
+{
+    if (state.opacityTrack == nullptr)
+    {
+        return;
+    }
+    int const pos = static_cast<int>(SendMessageW(state.opacityTrack, TBM_GETPOS, 0, 0));
+    state.renderer.SetOpacity(static_cast<float>(pos) / 100.0f);
+}
+
+void OnOpacityChanged(ControlState& state)
+{
+    SyncOpacityFromTrack(state);
+    SetStatusWithOverlay(
+        state,
+        L"Opacity updated (constant buffer only; texture generation unchanged).");
+}
+
+void OnFitImage(ControlState& state)
+{
+    if (!state.renderer.HasTexture())
+    {
+        SetStatusWithOverlay(state, L"Fit: no uploaded image.");
+        return;
+    }
+    tracing::graphics::OverlayPlacement overlay = state.overlay.LastPlacement();
+    if (overlay.width <= 0 || overlay.height <= 0)
+    {
+        overlay.width = 240;
+        overlay.height = 160;
+    }
+    unsigned const generation = state.renderer.TextureGeneration();
+    state.renderer.SetPlacement(tracing::graphics::FitPlacement(
+        static_cast<double>(state.renderer.TextureWidth()),
+        static_cast<double>(state.renderer.TextureHeight()),
+        static_cast<double>(overlay.width),
+        static_cast<double>(overlay.height)));
+    SetStatusWithOverlay(
+        state,
+        L"Fit: uniform contain in overlay. textureGeneration=" + std::to_wstring(generation) +
+            L" (unchanged).");
+}
+
+void OnResetPlacement(ControlState& state)
+{
+    if (!state.renderer.HasTexture())
+    {
+        SetStatusWithOverlay(state, L"Reset: no uploaded image.");
+        return;
+    }
+    unsigned const generation = state.renderer.TextureGeneration();
+    state.renderer.SetPlacement(tracing::graphics::ResetPlacement());
+    SetStatusWithOverlay(
+        state,
+        L"Reset: offset (0,0) scale 1. textureGeneration=" + std::to_wstring(generation) +
+            L" (unchanged).");
+}
+
+void OnShowReference(ControlState& state)
+{
+    if (!state.renderer.HasTexture())
+    {
+        SetStatusWithOverlay(state, L"Show reference: no uploaded image.");
+        return;
+    }
+    std::wstring error;
+    if (!state.reference.Show(state.renderer, error))
+    {
+        SetStatusWithOverlay(state, L"Show reference failed.\r\n" + error);
+        return;
+    }
+    SetStatusWithOverlay(
+        state,
+        L"Ordinary reference shown (WDA_NONE; independent of overlay fit/opacity/tracking; capture preview remains off).");
 }
 
 void StartCaptureNow(ControlState& state)
@@ -770,9 +922,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            316,
+            348,
             680,
-            440,
+            408,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -921,6 +1073,75 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdImportImage)),
             instance,
             nullptr);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"Opacity",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            12,
+            316,
+            60,
+            24,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->opacityTrack = CreateWindowExW(
+            0,
+            TRACKBAR_CLASSW,
+            L"",
+            WS_CHILD | WS_VISIBLE | TBS_AUTOTICKS | TBS_HORZ,
+            76,
+            312,
+            280,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdOpacity)),
+            instance,
+            nullptr);
+        SendMessageW(created->opacityTrack, TBM_SETRANGEMIN, FALSE, 0);
+        SendMessageW(created->opacityTrack, TBM_SETRANGEMAX, FALSE, 100);
+        SendMessageW(created->opacityTrack, TBM_SETPOS, TRUE, 100);
+        SendMessageW(created->opacityTrack, TBM_SETTICFREQ, 25, 0);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Fit",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            364,
+            312,
+            80,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdFit)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Reset",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            452,
+            312,
+            80,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdResetPlacement)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Show reference",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            540,
+            312,
+            152,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShowReference)),
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -942,6 +1163,21 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 {
                     OutputDebugStringW(previewError.c_str());
                     OutputDebugStringW(L"\r\n");
+                }
+                std::wstring rendererError;
+                if (!created->renderer.Create(created->device, rendererError))
+                {
+                    OutputDebugStringW(rendererError.c_str());
+                    OutputDebugStringW(L"\r\n");
+                }
+                else
+                {
+                    std::wstring referenceError;
+                    if (!created->reference.Create(hwnd, created->device, referenceError))
+                    {
+                        OutputDebugStringW(referenceError.c_str());
+                        OutputDebugStringW(L"\r\n");
+                    }
                 }
             }
         }
@@ -1008,11 +1244,34 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 OnImportImage(*state);
                 return 0;
             }
+            if (id == kIdFit && code == BN_CLICKED)
+            {
+                OnFitImage(*state);
+                return 0;
+            }
+            if (id == kIdResetPlacement && code == BN_CLICKED)
+            {
+                OnResetPlacement(*state);
+                return 0;
+            }
+            if (id == kIdShowReference && code == BN_CLICKED)
+            {
+                OnShowReference(*state);
+                return 0;
+            }
             if (id == kIdList && code == LBN_DBLCLK)
             {
                 SelectFromUi(*state);
                 return 0;
             }
+        }
+        break;
+    case WM_HSCROLL:
+        if (state != nullptr && state->opacityTrack != nullptr &&
+            reinterpret_cast<HWND>(lParam) == state->opacityTrack)
+        {
+            OnOpacityChanged(*state);
+            return 0;
         }
         break;
     case kMsgGeometry:
@@ -1077,7 +1336,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         {
             StopCapture(*state);
             StopWatching(*state);
+            state->reference.Release();
             state->preview.Release();
+            state->renderer.Release();
             state->overlay.Release();
             state->device.Release();
             delete state;
@@ -1099,6 +1360,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     {
         return 1;
     }
+
+    INITCOMMONCONTROLSEX common{};
+    common.dwSize = sizeof(common);
+    common.dwICC = ICC_BAR_CLASSES;
+    InitCommonControlsEx(&common);
 
     winrt::init_apartment(winrt::apartment_type::single_threaded);
 

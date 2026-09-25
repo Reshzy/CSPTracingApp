@@ -28,11 +28,97 @@ add_executable(TracingApp WIN32
     src/graphics/DeviceResources.cpp
     src/graphics/OverlaySurface.cpp
     src/graphics/CapturePreview.cpp
+    src/graphics/ImageRenderer.cpp
+    src/app/ReferenceWindow.cpp
     src/capture/CaptureSession.cpp
     src/image/ImageLoader.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
-target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid gdi32 WindowsApp windowscodecs ole32 uuid shell32)
+target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid gdi32 comctl32 WindowsApp windowscodecs ole32 uuid shell32)
+
+set(_fxc_hints)
+if(DEFINED ENV{WindowsSdkVerBinPath})
+    list(APPEND _fxc_hints "$ENV{WindowsSdkVerBinPath}x64")
+endif()
+if(DEFINED ENV{WindowsSdkDir})
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        list(APPEND _fxc_hints
+            "$ENV{WindowsSdkDir}bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64")
+    endif()
+    list(APPEND _fxc_hints "$ENV{WindowsSdkDir}bin/x64")
+endif()
+if(CMAKE_WINDOWS_KITS_10_DIR)
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        list(APPEND _fxc_hints
+            "${CMAKE_WINDOWS_KITS_10_DIR}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64")
+    endif()
+    list(APPEND _fxc_hints "${CMAKE_WINDOWS_KITS_10_DIR}/bin/x64")
+endif()
+get_filename_component(_windows_kits_root
+    "[HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows Kits\\Installed Roots;KitsRoot10]"
+    ABSOLUTE)
+if(_windows_kits_root AND EXISTS "${_windows_kits_root}")
+    if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+        list(APPEND _fxc_hints
+            "${_windows_kits_root}/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64")
+    endif()
+    list(APPEND _fxc_hints "${_windows_kits_root}/bin/x64")
+endif()
+if(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION)
+    list(APPEND _fxc_hints
+        "$ENV{ProgramFiles\(x86\)}/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64"
+        "$ENV{ProgramFiles}/Windows Kits/10/bin/${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}/x64")
+endif()
+unset(FXC_EXECUTABLE CACHE)
+find_program(FXC_EXECUTABLE NAMES fxc fxc.exe HINTS ${_fxc_hints})
+if(NOT FXC_EXECUTABLE)
+    set(_fxc_glob_roots)
+    if(DEFINED ENV{WindowsSdkDir})
+        list(APPEND _fxc_glob_roots "$ENV{WindowsSdkDir}")
+    endif()
+    if(_windows_kits_root)
+        list(APPEND _fxc_glob_roots "${_windows_kits_root}")
+    endif()
+    if(CMAKE_WINDOWS_KITS_10_DIR)
+        list(APPEND _fxc_glob_roots "${CMAKE_WINDOWS_KITS_10_DIR}")
+    endif()
+    foreach(_fxc_root IN LISTS _fxc_glob_roots)
+        file(GLOB _fxc_glob "${_fxc_root}/bin/*/x64/fxc.exe")
+        if(_fxc_glob)
+            list(SORT _fxc_glob)
+            list(GET _fxc_glob -1 FXC_EXECUTABLE)
+            break()
+        endif()
+    endforeach()
+endif()
+if(NOT FXC_EXECUTABLE)
+    message(FATAL_ERROR
+        "fxc.exe not found (missing Windows SDK shader compiler, not a source compile failure). "
+        "SDK version='${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}'. Searched HINTS: ${_fxc_hints}.")
+endif()
+message(STATUS "TracingApp fxc: ${FXC_EXECUTABLE}")
+
+set(TRACING_SHADER_DIR "${CMAKE_BINARY_DIR}/shaders")
+set(TRACING_IMAGE_VS "${TRACING_SHADER_DIR}/ImageVS.cso")
+set(TRACING_IMAGE_PS "${TRACING_SHADER_DIR}/ImagePS.cso")
+add_custom_command(
+    OUTPUT "${TRACING_IMAGE_VS}" "${TRACING_IMAGE_PS}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${TRACING_SHADER_DIR}"
+    COMMAND "${FXC_EXECUTABLE}" /nologo /T vs_5_0 /E VSMain /Fo "${TRACING_IMAGE_VS}"
+            "${CMAKE_SOURCE_DIR}/shaders/Image.hlsl"
+    COMMAND "${FXC_EXECUTABLE}" /nologo /T ps_5_0 /E PSMain /Fo "${TRACING_IMAGE_PS}"
+            "${CMAKE_SOURCE_DIR}/shaders/Image.hlsl"
+    DEPENDS "${CMAKE_SOURCE_DIR}/shaders/Image.hlsl"
+    COMMENT "Compiling shaders/Image.hlsl with discovered fxc"
+    VERBATIM)
+add_custom_target(TracingAppShaders DEPENDS "${TRACING_IMAGE_VS}" "${TRACING_IMAGE_PS}")
+add_dependencies(TracingApp TracingAppShaders)
+add_custom_command(TARGET TracingApp POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+        "${TRACING_IMAGE_VS}"
+        "${TRACING_IMAGE_PS}"
+        "$<TARGET_FILE_DIR:TracingApp>"
+    VERBATIM)
 
 add_executable(TracingApp.BootstrapTests
     tests/unit/bootstrap_tests.cpp
