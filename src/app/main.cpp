@@ -16,6 +16,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 
 #ifndef TRACING_APP_TESTING
 
+#include "graphics/DeviceResources.h"
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
 
@@ -41,6 +42,7 @@ struct ControlState
     std::optional<tracing::platform::TargetIdentity> selected;
     tracing::platform::TargetLifecycleWatcher watcher;
     tracing::platform::GeometrySnapshot lastGeometry;
+    tracing::graphics::DeviceResources device;
     std::uint64_t nextGeneration = 1;
 };
 
@@ -49,6 +51,11 @@ std::wstring ControlDpiLine(HWND hwnd)
     unsigned const dpi = hwnd != nullptr ? GetDpiForWindow(hwnd) : 0;
     return L"control DPI=" + std::to_wstring(dpi) +
            L" (physical, PerMonitorV2; not canvas bounds)\r\n";
+}
+
+std::wstring StatusHeader(ControlState const& state)
+{
+    return ControlDpiLine(state.control) + state.device.FormatReport() + L"\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -71,7 +78,7 @@ void StopWatching(ControlState& state)
 
 void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
 {
-    std::wstring text = ControlDpiLine(state.control);
+    std::wstring text = StatusHeader(state);
     if (!state.selected.has_value())
     {
         if (!extra.empty())
@@ -172,7 +179,7 @@ void RefreshCandidates(ControlState& state)
     std::wstring error;
     if (!tracing::platform::EnumerateTopLevelCandidates(state.candidates, error))
     {
-        SetStatus(state, ControlDpiLine(state.control) + error);
+        SetStatus(state, StatusHeader(state) + error);
         return;
     }
     RefillList(state);
@@ -215,7 +222,7 @@ void RefreshCandidates(ControlState& state)
             state.selected.reset();
             SetStatus(
                 state,
-                ControlDpiLine(state.control) +
+                StatusHeader(state) +
                     L"Previous target is gone. HWND is no longer valid; geometry invalidated. "
                     L"Select a painting window again.");
             return;
@@ -226,7 +233,7 @@ void RefreshCandidates(ControlState& state)
             state.selected.reset();
             SetStatus(
                 state,
-                ControlDpiLine(state.control) +
+                StatusHeader(state) +
                     L"Previous HWND was reused by another process. Target and geometry cleared so "
                     L"a launcher or second instance cannot silently replace it. Select again.");
             return;
@@ -235,7 +242,7 @@ void RefreshCandidates(ControlState& state)
         {
             SetStatus(
                 state,
-                ControlDpiLine(state.control) +
+                StatusHeader(state) +
                     (accessError.empty()
                          ? tracing::platform::FormatAccessFailure(
                                stored.process.pid, ERROR_ACCESS_DENIED)
@@ -249,7 +256,7 @@ void RefreshCandidates(ControlState& state)
 
     SetStatus(
         state,
-        ControlDpiLine(state.control) +
+        StatusHeader(state) +
             L"Refreshed top-level windows. Select a PAINT row (CLIPStudioPaint.exe), then Select. "
             L"Launcher rows are never chosen automatically.");
 }
@@ -273,7 +280,7 @@ void SelectFromUi(ControlState& state)
         state.nextGeneration);
     if (selection.status != tracing::platform::SelectionStatus::Selected)
     {
-        SetStatus(state, ControlDpiLine(state.control) + selection.message);
+        SetStatus(state, StatusHeader(state) + selection.message);
         return;
     }
 
@@ -356,6 +363,12 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSelect)),
             instance,
             nullptr);
+        std::wstring deviceError;
+        if (!created->device.Create(deviceError))
+        {
+            OutputDebugStringW(deviceError.c_str());
+            OutputDebugStringW(L"\r\n");
+        }
         RefreshCandidates(*created);
         return 0;
     }
@@ -405,6 +418,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (state != nullptr)
         {
             StopWatching(*state);
+            state->device.Release();
             delete state;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
         }

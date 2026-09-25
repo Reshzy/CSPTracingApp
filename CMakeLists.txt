@@ -25,9 +25,10 @@ add_executable(TracingApp WIN32
     src/app/main.cpp
     ${TRACING_APP_PLATFORM_SOURCES}
     src/platform/TargetGeometry.cpp
+    src/graphics/DeviceResources.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
-target_link_libraries(TracingApp PRIVATE dwmapi)
+target_link_libraries(TracingApp PRIVATE dwmapi d3d11 dxgi dxguid)
 
 add_executable(TracingApp.BootstrapTests
     tests/unit/bootstrap_tests.cpp
@@ -42,6 +43,12 @@ add_executable(TracingApp.TargetSelectionTests
 tracing_app_apply_first_party_options(TracingApp.TargetSelectionTests)
 target_link_libraries(TracingApp.TargetSelectionTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.GraphicsPolicyTests
+    tests/unit/GraphicsPolicyTests.cpp)
+tracing_app_apply_first_party_options(TracingApp.GraphicsPolicyTests)
+target_link_libraries(TracingApp.GraphicsPolicyTests PRIVATE GTest::gtest_main)
+
 enable_testing()
 add_test(NAME TracingApp.BootstrapTests COMMAND TracingApp.BootstrapTests)
 add_test(NAME TracingApp.TargetSelectionTests COMMAND TracingApp.TargetSelectionTests)
+add_test(NAME TracingApp.GraphicsPolicyTests COMMAND TracingApp.GraphicsPolicyTests)

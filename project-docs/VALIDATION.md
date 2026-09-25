@@ -1,17 +1,17 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains NOT RUN. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. OBS recording and hardware acceptance testing remain NOT RUN.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains NOT RUN. Prompt 04 embedded PerMonitorV2 DPI awareness and target geometry/lifecycle reporting; real CSP mixed-DPI/lifecycle remains NOT RUN. Prompt 05 created a BGRA D3D11 device with RAII immediate-context ownership and GPU-free lifecycle tests; overlay/capture remain later. OBS recording and hardware acceptance testing remain NOT RUN.
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: HEAD `2bb21dce` (`feature/init`, Prompt 04 files uncommitted); Win32 control window with candidate list, PerMonitorV2 manifest, and geometry status; Debug `out/build/windows-debug/Debug/TracingApp.exe` (859648 bytes, 2026-09-25 16:51:09); Release not rebuilt this step
+- App commit/build and renderer path: HEAD `c2557c2` (`feature/init`, Prompt 05 files uncommitted); Win32 control window with candidate list, PerMonitorV2 manifest, geometry status, and a shared BGRA D3D11 device (no swap chain/renderer/capture); Debug `out/build/windows-debug/Debug/TracingApp.exe` (883200 bytes, 2026-09-25 17:02:19); Release not rebuilt this step
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). SDR/HDR NOT RECORDED
 - Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
 - OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
 - C++/WinRT (verify-only, not linked): SDK `10.0.26100.0` headers present at `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\cppwinrt\winrt\base.h` and `windows.graphics.capture.h`; `cppwinrt.exe` v2.0.250303.5. Windows App SDK not adopted.
-- GPU, driver, monitor sizes/refresh/DPI/origins: NVIDIA GeForce RTX 3060 driver 32.0.16.1656; AMD Radeon(TM) Graphics driver 32.0.21042.62. Screens: `\\.\DISPLAY2` primary Bounds={X=0,Y=0,Width=1920,Height=1080} effective DPI 96x96; `\\.\DISPLAY1` Bounds={X=1920,Y=0,Width=2560,Height=1440} effective DPI 96x96. Refresh NOT RECORDED. Negative-origin monitor not present (`MonitorFromPoint(-100,100)` resolved to the primary). Mixed-DPI not present (both 96).
+- GPU, driver, monitor sizes/refresh/DPI/origins: NVIDIA GeForce RTX 3060 driver 32.0.16.1656; AMD Radeon(TM) Graphics driver 32.0.21042.62. Prompt 05 default DXGI adapter was `NVIDIA GeForce RTX 3060` vendor=0x10DE device=0x24C7, D3D_FEATURE_LEVEL_11_1. Screens: `\\.\DISPLAY2` primary Bounds={X=0,Y=0,Width=1920,Height=1080} effective DPI 96x96; `\\.\DISPLAY1` Bounds={X=1920,Y=0,Width=2560,Height=1440} effective DPI 96x96. Refresh NOT RECORDED. Negative-origin monitor not present (`MonitorFromPoint(-100,100)` resolved to the primary). Mixed-DPI not present (both 96).
 - CSP version/locale/theme/workspace and drawing device: NOT RECORDED
 - OBS version, Display Capture method/settings, recording resolution/FPS: NOT RECORDED
 
@@ -19,7 +19,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 
 - M0 reproducible shell/build/tests: PASS (Prompts 01–02 plus Prompt 04 DPI manifest: local Git, Win32 control window, PerMonitorV2 RT_MANIFEST, vcpkg baseline, first-party `/W4` `/permissive-`, GoogleTest, Debug configure/build/test)
 - M1 CSP discovery/geometry/lifecycle: NOT RUN (Prompt 03 automated filter/selection tests PASS; Prompt 04 geometry/lifecycle code and control-window DPI smoke test PASS; real CSP enumerate/select, mixed-DPI move, minimize/restore/close remain unavailable this step)
-- M2 transparency/input/affinity: NOT RUN
+- M2 transparency/input/affinity: NOT RUN (Prompt 05 shared D3D11 device create/shutdown PASS; overlay surface, affinity, and input pass-through remain Prompts 06–07)
 - M3 actual CSP capture/resize/no-feedback: NOT RUN
 - M4 imported image/ordinary reference/OBS playback: NOT RUN — mandatory before tracking
 - M5 manual transforms/calibration: NOT RUN
@@ -325,6 +325,65 @@ Manual checklist remaining for real CSP geometry:
   6. If a negative-origin monitor exists, drag CSP onto it and record a negative client origin.
   7. Minimize, restore, then close CSP; eligibility should become minimized then target-dead, and the target must clear (no silent HWND reuse).
 Blocker or next prompt: 05 — Shared D3D11 device
+```
+
+```text
+Step / milestone: 05 / M2 shared D3D11 device (no overlay)
+Date / commit: 2026-09-25 / working tree on feature/init ahead of c2557c2 (uncommitted)
+Status: PASS for Debug configure/build/test, real hardware device-create/shutdown smoke, and debug-layer live-object capture; overlay/capture NOT RUN
+Changed files:
+  src/graphics/DeviceResources.h (new)
+  src/graphics/DeviceResources.cpp (new)
+  src/app/main.cpp
+  CMakeLists.txt
+  tests/unit/GraphicsPolicyTests.cpp (new)
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  cmake --preset windows-debug
+  exit 0
+  reused gtest:x64-windows@1.17.0#3; SDK 10.0.26100.0; binaryDir out/build/windows-debug
+Build command + exit code:
+  cmake --build --preset windows-debug
+  exit 0
+  MSBuild 18.10.1-1.26427.6+3cd27c13e
+  TracingApp.exe 883200 bytes (2026-09-25 17:02:19)
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 3, passed 3, failed 0
+    TracingApp.BootstrapTests 0.64s
+    TracingApp.TargetSelectionTests 0.01s
+    TracingApp.GraphicsPolicyTests 0.03s
+  GraphicsPolicyTests --gtest_brief=1: 8 tests from 2 suites, all PASSED
+    debug-layer-missing does not fail; hardware CreateFailed is Failed
+    Ready -> Removed -> Retrying -> Ready; retry exhaustion Failed
+    Shutdown from Uninitialized/Ready/Removed/Retrying/Failed -> Released
+    feature level 11_1/11_0 labels
+Manual setup and exact actions:
+  Start-Process TracingApp.exe; wait 2s; read Static child text; CloseMainWindow; WaitForExit 5s
+  DBWIN_BUFFER listener around a second launch/close to capture ID3D11Debug::ReportLiveDeviceObjects
+Expected / actual:
+  expected: BGRA-capable hardware D3D11 device, exclusive immediate context, debug layer enabled if installed (absence is not create failure), adapter/feature level/removed-reason in status, clean exit
+  actual PID 20784, MainWindowTitle=TracingApp, hwnd=1511794, GetDpiForWindow=96, CloseMainWindow=True, ExitCode=0, no leftover process
+    D3D11 adapter="NVIDIA GeForce RTX 3060" vendor=0x10DE device=0x24C7 featureLevel=11_1 state=Ready
+    debugLayer requested=yes enabled create=0x00000000 removed=0x00000000 liveObjectsReported=no (report runs on shutdown)
+  live-object OutputDebugString on shutdown (appPid 10368):
+    D3D11 WARNING: Live ID3D11Device at 0x0000013D92BADF10, Refcount: 2 [ STATE_CREATION WARNING #441: LIVE_DEVICE]
+    no live context/texture/buffer names were emitted; LIVE_DEVICE is consistent with ID3D11Debug still holding the device after our ComPtrs were released. Not a GPU reset.
+Evidence paths (local, no private artwork committed):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/build/windows-debug/Debug/TracingApp.GraphicsPolicyTests.exe
+Measured samples / p50 / p95 / max where applicable: n/a
+Known limitations / unavailable hardware:
+  cmake/ctest not on PATH; invoked via VS 2026 bundled binaries
+  Release configure/build/test NOT RUN this step
+  no swap chain, overlay, DirectComposition, WGC, or OpenCV
+  device-removed retry is covered by the injectable policy tests only; no real driver reset was induced
+  CLIP STUDIO PAINT not required and not used this step
+Manual checklist remaining:
+  none for this prompt; overlay/affinity/pass-through are Prompt 06–07
+Blocker or next prompt: 06 — Transparent overlay surface and affinity
 ```
 
 ## Final acceptance
