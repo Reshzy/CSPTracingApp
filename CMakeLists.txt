@@ -12,12 +12,18 @@ find_package(GTest CONFIG REQUIRED)
 function(tracing_app_apply_first_party_options target)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE)
     target_compile_features(${target} PRIVATE cxx_std_23)
+    target_include_directories(${target} PRIVATE "${CMAKE_SOURCE_DIR}/src")
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive-)
     endif()
 endfunction()
 
-add_executable(TracingApp WIN32 src/app/main.cpp)
+set(TRACING_APP_PLATFORM_SOURCES
+    src/platform/TargetDiscovery.cpp)
+
+add_executable(TracingApp WIN32
+    src/app/main.cpp
+    ${TRACING_APP_PLATFORM_SOURCES})
 tracing_app_apply_first_party_options(TracingApp)
 
 add_executable(TracingApp.BootstrapTests
@@ -27,5 +33,12 @@ target_compile_definitions(TracingApp.BootstrapTests PRIVATE TRACING_APP_TESTING
 tracing_app_apply_first_party_options(TracingApp.BootstrapTests)
 target_link_libraries(TracingApp.BootstrapTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.TargetSelectionTests
+    tests/unit/TargetSelectionTests.cpp
+    ${TRACING_APP_PLATFORM_SOURCES})
+tracing_app_apply_first_party_options(TracingApp.TargetSelectionTests)
+target_link_libraries(TracingApp.TargetSelectionTests PRIVATE GTest::gtest_main)
+
 enable_testing()
 add_test(NAME TracingApp.BootstrapTests COMMAND TracingApp.BootstrapTests)
+add_test(NAME TracingApp.TargetSelectionTests COMMAND TracingApp.TargetSelectionTests)

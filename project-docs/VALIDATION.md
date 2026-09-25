@@ -1,12 +1,12 @@
 # TracingApp — validation record
 
-Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. CSP interaction, OBS recording, and hardware acceptance testing remain NOT RUN.
+Planning baseline: 2026-09-25. Prompt 01 Debug bootstrap compiled and tested on 2026-09-25. Prompt 02 pinned vcpkg/GoogleTest and verified Debug+Release on 2026-09-25. Prompt 03 added target discovery with automated selection tests; real CSP window selection remains NOT RUN. OBS recording and hardware acceptance testing remain NOT RUN.
 
 Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A successful API call or synthetic replay does not certify OBS behavior or real CSP tracking.
 
 ## Environment — fill when implementing
 
-- App commit/build and renderer path: HEAD `93e2402` (`feature/init`, Prompt 02 files uncommitted); Win32 control-window shell only; Debug `out/build/windows-debug/Debug/TracingApp.exe` (54272 bytes, 2026-09-25 16:22:59); Release `out/build/windows-release/Release/TracingApp.exe` (11264 bytes, 2026-09-25 16:23:24)
+- App commit/build and renderer path: HEAD `bd02be3` (`feature/init`, Prompt 03 files uncommitted); Win32 control window with candidate list; Debug `out/build/windows-debug/Debug/TracingApp.exe` (829952 bytes, 2026-09-25 16:28:57); Release not rebuilt this step
 - Windows edition/build and SDR/HDR state: registry `ProductName` Windows 10 Pro, `DisplayVersion` 25H2, build 26200.9457 (`EditionID` Professional). SDR/HDR NOT RECORDED
 - Visual Studio/MSVC, Windows SDK, CMake, vcpkg baseline/triplet: Visual Studio Community 2026 18.10.2 at `C:\Program Files\Microsoft Visual Studio\18\Community`; MSVC 14.51.36231 / `cl` 19.51.36260.0 (`Hostx64/x64`); Windows SDK 10.0.26100.0; CMake/CTest 4.3.1-msvc1 (not on PATH) at `C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`; generator Visual Studio 18 2026 x64; vcpkg VS 2026 bundled at `%VCPKG_ROOT%` = `C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg` (not a git working copy); `vcpkg-bundle.json` `embeddedsha` / `vcpkg.json` `builtin-baseline` `1460b31b08c42cc2e9ac2c79f45ec8707e2675e2`; `vcpkg.exe version` `2026-07-27-98d7cb0cf1f4686a3e43aa5672b6230c1d56bce8`; triplet `x64-windows`
 - OpenCV and GoogleTest resolved versions: OpenCV not introduced; GoogleTest `gtest:x64-windows@1.17.0#3` from git registry (`microsoft/vcpkg@dab84cf3bb50ef2ca3e0b0212c1d55e9e05a75bc`)
@@ -18,7 +18,7 @@ Use PASS / FAIL / BLOCKED / NOT RUN. Each entry must include actual evidence. A 
 ## Milestone status
 
 - M0 reproducible shell/build/tests: PASS (Prompts 01–02: local Git, Win32 control window, vcpkg baseline, first-party `/W4` `/permissive-`, GoogleTest, Debug+Release `--fresh` configure/build/test. DPI manifest remains Prompt 04)
-- M1 CSP discovery/geometry/lifecycle: NOT RUN
+- M1 CSP discovery/geometry/lifecycle: NOT RUN (Prompt 03 automated filter/selection tests PASS; real CSP enumerate/select, geometry, and lifecycle remain later / unavailable this step)
 - M2 transparency/input/affinity: NOT RUN
 - M3 actual CSP capture/resize/no-feedback: NOT RUN
 - M4 imported image/ordinary reference/OBS playback: NOT RUN — mandatory before tracking
@@ -202,6 +202,66 @@ Known limitations / unavailable hardware:
   DPI manifest, capture, OpenCV, overlay, and OBS remain later steps
   Windows SDR/HDR, monitor refresh/DPI/origins not measured
 Blocker or next prompt: 03 — Target discovery
+```
+
+```text
+Step / milestone: 03 / M1 target discovery (automated only)
+Date / commit: 2026-09-25 / working tree on feature/init ahead of bd02be3 (uncommitted)
+Status: PASS for automated tests; real CSP selection NOT RUN
+Changed files:
+  src/platform/TargetDiscovery.h (new)
+  src/platform/TargetDiscovery.cpp (new)
+  src/app/main.cpp
+  CMakeLists.txt
+  tests/unit/TargetSelectionTests.cpp (new)
+  project-docs/VALIDATION.md
+Configure command + exit code:
+  $env:VCPKG_ROOT = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\vcpkg"
+  cmake --preset windows-debug
+  exit 0
+  reused gtest:x64-windows@1.17.0#3; SDK 10.0.26100.0; CXX MSVC 19.51.36260.0
+Build command + exit code:
+  cmake --build --preset windows-debug
+  exit 0
+  MSBuild 18.10.1-1.26427.6+3cd27c13e
+  TracingApp.exe 829952 bytes; TracingApp.TargetSelectionTests.exe 945152 bytes
+Test command + discovered/passed/failed counts:
+  ctest --preset windows-debug --output-on-failure
+  exit 0
+  discovered 2, passed 2, failed 0
+    TracingApp.BootstrapTests 0.05s
+    TracingApp.TargetSelectionTests 0.06s
+  TargetSelectionTests --gtest_brief=1: 6 tests from 3 suites, all PASSED
+    classification (exe vs launcher/owned/hidden/access)
+    ambiguous two-paint windows require explicit index
+    single paint auto-resolve; launcher explicit select rejected
+    dead/invisible, access-denied message, other-process reject
+    HWND dead vs PID/creation-time reuse
+Manual setup and exact actions:
+  Get-CimInstance Win32_Process filtered for clipstudio|csp: no matching processes
+  Start-Process out/build/windows-debug/Debug/TracingApp.exe; wait 2s
+  PID 38200, MainWindowTitle=TracingApp, Responding=True, CloseMainWindow=True, ExitCode=0
+Expected / actual:
+  expected: enumerate top-level windows, classify by process image not title/class alone, explicit select when ambiguous, reject dead/reused HWND, no injection/admin default
+  actual: automated policy tests pass; control window launched and closed cleanly
+  real CLIPStudioPaint.exe selection and launcher/second-instance replacement check NOT RUN (no CSP process)
+Evidence paths (local, no private artwork committed):
+  out/build/windows-debug/Debug/TracingApp.exe
+  out/build/windows-debug/Debug/TracingApp.TargetSelectionTests.exe
+Measured samples / p50 / p95 / max where applicable: n/a
+Known limitations / unavailable hardware:
+  CLIP STUDIO PAINT / launcher not running; CSP version/locale/theme NOT RECORDED
+  Release configure/build/test NOT RUN this step
+  geometry, DPI, lifecycle remain Prompt 04
+  no process injection; OpenProcess uses PROCESS_QUERY_LIMITED_INFORMATION only
+Manual checklist remaining for real CSP:
+  1. Start CLIP STUDIO PAINT with a document window (not only the launcher).
+  2. Optionally start a second paint instance or leave the launcher open.
+  3. Run TracingApp.exe, click Refresh, confirm PAINT vs LAUNCHER rows.
+  4. With two PAINT rows, click Select with none highlighted: expect Ambiguous, no attach.
+  5. Highlight one PAINT row and Select: status shows PID and generation.
+  6. Close that document or replace the HWND and Refresh: expect target cleared, no silent reuse.
+Blocker or next prompt: 04 — Physical geometry and lifecycle
 ```
 
 ## Final acceptance
