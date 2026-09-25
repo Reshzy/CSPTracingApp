@@ -29,6 +29,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "graphics/DeviceResources.h"
 #include "graphics/ImageRenderer.h"
 #include "graphics/OverlaySurface.h"
+#include "core/Transform2D.h"
 #include "image/ImageLoader.h"
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
@@ -59,6 +60,7 @@ constexpr int kIdShowReference = 1017;
 constexpr int kIdObsPositiveControl = 1018;
 constexpr int kIdObsSkipOverlayImage = 1019;
 constexpr int kIdRecreateOverlay = 1020;
+constexpr int kIdTransformDiag = 1021;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -176,7 +178,8 @@ std::wstring StatusHeader(ControlState const& state)
            std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") +
            L" obsSkipOverlayImagePresent=" +
            std::wstring(state.obsSkipOverlayImagePresent ? L"yes" : L"no") +
-           L" (temporary OBS-gate diagnostic)\r\n";
+           L" (temporary OBS-gate diagnostic)\r\n"
+           L"Transform diag: canned pR=(10,5)->pO=(2040,102); numerical only (not tracking)\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -867,6 +870,12 @@ void OnRecreateOverlay(ControlState& state)
             tracing::graphics::FormatOverlayAffinityMode(state.overlay.AffinityMode()) + L").");
 }
 
+void OnTransformDiag(ControlState& state)
+{
+    std::string const ascii = tracing::core::FormatCannedTransformDiagnostic();
+    SetStatus(state, std::wstring(ascii.begin(), ascii.end()));
+}
+
 void OnShowReference(ControlState& state)
 {
     if (!state.renderer.HasTexture())
@@ -1030,9 +1039,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            384,
+            408,
             680,
-            372,
+            348,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -1291,6 +1300,19 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdRecreateOverlay)),
             instance,
             nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Transform diag",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            12,
+            376,
+            160,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdTransformDiag)),
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -1421,6 +1443,11 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdRecreateOverlay && code == BN_CLICKED)
             {
                 OnRecreateOverlay(*state);
+                return 0;
+            }
+            if (id == kIdTransformDiag && code == BN_CLICKED)
+            {
+                OnTransformDiag(*state);
                 return 0;
             }
             if (id == kIdList && code == LBN_DBLCLK)
