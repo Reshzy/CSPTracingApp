@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 
 find_package(GTest CONFIG REQUIRED)
+find_package(OpenCV CONFIG REQUIRED COMPONENTS core imgproc features2d calib3d)
+message(STATUS "TracingApp OpenCV: ${OpenCV_VERSION}")
 
 function(tracing_app_apply_first_party_options target)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE)
@@ -175,6 +177,18 @@ add_executable(TracingApp.RoiTests
 tracing_app_apply_first_party_options(TracingApp.RoiTests)
 target_link_libraries(TracingApp.RoiTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.VisualTrackerTests
+    tests/unit/VisualTrackerTests.cpp
+    src/tracking/VisualTracker.cpp
+    src/core/Transform2D.cpp)
+tracing_app_apply_first_party_options(TracingApp.VisualTrackerTests)
+target_link_libraries(TracingApp.VisualTrackerTests PRIVATE
+    GTest::gtest_main
+    opencv_core
+    opencv_imgproc
+    opencv_features2d
+    opencv_calib3d)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -190,4 +204,5 @@ add_test(NAME TracingApp.ImageLoaderTests COMMAND TracingApp.ImageLoaderTests)
 add_test(NAME TracingApp.TransformTests COMMAND TracingApp.TransformTests)
 add_test(NAME TracingApp.CalibrationTests COMMAND TracingApp.CalibrationTests)
 add_test(NAME TracingApp.RoiTests COMMAND TracingApp.RoiTests)
+add_test(NAME TracingApp.VisualTrackerTests COMMAND TracingApp.VisualTrackerTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)
