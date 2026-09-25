@@ -167,3 +167,55 @@ TEST(OverlayAffinity, ReadyRequiresSetAndMatchingReadback)
     status.setResult = 0;
     EXPECT_FALSE(AffinityIsReady(status));
 }
+
+TEST(OverlayAffinity, TemporaryNoneReadyOnlyOnNoneReadback)
+{
+    using tracing::graphics::AffinityIsReadyForMode;
+    using tracing::graphics::FormatOverlayAffinityMode;
+    using tracing::graphics::OverlayAffinityMode;
+
+    OverlayAffinityStatus status{};
+    status.setCalled = true;
+    status.setResult = 1;
+    status.matchesExcludeFromCapture = true;
+    status.matchesNone = false;
+    EXPECT_TRUE(AffinityIsReady(status));
+    EXPECT_FALSE(AffinityIsReadyForMode(
+        status, OverlayAffinityMode::TemporaryNonePositiveControl));
+    EXPECT_EQ(
+        FormatOverlayAffinityMode(OverlayAffinityMode::TemporaryNonePositiveControl),
+        L"temporary-none-positive-control");
+
+    status.matchesExcludeFromCapture = false;
+    status.matchesNone = true;
+    EXPECT_FALSE(AffinityIsReady(status));
+    EXPECT_TRUE(AffinityIsReadyForMode(
+        status, OverlayAffinityMode::TemporaryNonePositiveControl));
+    EXPECT_FALSE(AffinityIsReadyForMode(status, OverlayAffinityMode::ExcludeFromCapture));
+
+    status.matchesNone = false;
+    EXPECT_FALSE(AffinityIsReadyForMode(
+        status, OverlayAffinityMode::TemporaryNonePositiveControl));
+}
+
+TEST(OverlayAffinity, RestoredExcludeRequiresExcludeReadback)
+{
+    using tracing::graphics::AffinityIsReadyForMode;
+    using tracing::graphics::FormatOverlayAffinityMode;
+    using tracing::graphics::OverlayAffinityMode;
+
+    OverlayAffinityStatus status{};
+    status.setCalled = true;
+    status.setResult = 1;
+    status.matchesNone = true;
+    EXPECT_FALSE(AffinityIsReadyForMode(status, OverlayAffinityMode::ExcludeFromCapture));
+    EXPECT_EQ(
+        FormatOverlayAffinityMode(OverlayAffinityMode::ExcludeFromCapture),
+        L"exclude-from-capture");
+
+    status.matchesNone = false;
+    status.matchesExcludeFromCapture = true;
+    EXPECT_TRUE(AffinityIsReadyForMode(status, OverlayAffinityMode::ExcludeFromCapture));
+    EXPECT_FALSE(AffinityIsReadyForMode(
+        status, OverlayAffinityMode::TemporaryNonePositiveControl));
+}

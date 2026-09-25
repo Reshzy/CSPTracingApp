@@ -56,6 +56,9 @@ constexpr int kIdOpacity = 1014;
 constexpr int kIdFit = 1015;
 constexpr int kIdResetPlacement = 1016;
 constexpr int kIdShowReference = 1017;
+constexpr int kIdObsPositiveControl = 1018;
+constexpr int kIdObsSkipOverlayImage = 1019;
+constexpr int kIdRecreateOverlay = 1020;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -81,7 +84,10 @@ struct ControlState
     tracing::app::ReferenceWindow reference;
     HWND previewCheck = nullptr;
     HWND opacityTrack = nullptr;
+    HWND obsPositiveControlCheck = nullptr;
+    HWND obsSkipOverlayImageCheck = nullptr;
     bool hideOverlayOnCaptureLoss = false;
+    bool obsSkipOverlayImagePresent = false;
     std::uint64_t nextGeneration = 1;
 };
 
@@ -114,6 +120,8 @@ tracing::graphics::CaptureToClientMapping MappingFromState(ControlState const& s
         dwm.width,
         dwm.height);
 }
+
+void SyncObsDiagnosticCheckboxes(ControlState& state);
 
 void SyncPreviewCheckbox(ControlState& state)
 {
@@ -164,7 +172,10 @@ std::wstring StatusHeader(ControlState const& state)
            state.renderer.FormatReport() + L"\r\n" +
            state.reference.FormatReport() + L"\r\n" +
            L"overlayHiddenOnCaptureLoss=" +
-           std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") + L"\r\n";
+           std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") +
+           L" obsSkipOverlayImagePresent=" +
+           std::wstring(state.obsSkipOverlayImagePresent ? L"yes" : L"no") +
+           L" (temporary OBS-gate diagnostic)\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -248,7 +259,8 @@ void SyncOverlayFromState(ControlState& state)
         controlForeground,
         hasTarget,
         error);
-    if (state.overlay.IsVisible() && state.renderer.HasTexture())
+    if (state.overlay.IsVisible() && state.renderer.HasTexture() &&
+        !state.obsSkipOverlayImagePresent)
     {
         std::wstring presentError;
         if (!state.renderer.DrawAndPresent(
@@ -276,6 +288,7 @@ void SyncOverlayFromState(ControlState& state)
 void SetStatusWithOverlay(ControlState& state, std::wstring const& body)
 {
     SyncPreviewCheckbox(state);
+    SyncObsDiagnosticCheckboxes(state);
     SyncOverlayFromState(state);
     if (body.empty())
     {
@@ -759,6 +772,100 @@ void OnResetPlacement(ControlState& state)
             L" (unchanged).");
 }
 
+void SyncObsDiagnosticCheckboxes(ControlState& state)
+{
+    if (state.obsPositiveControlCheck != nullptr)
+    {
+        bool const none =
+            state.overlay.AffinityMode() ==
+            tracing::graphics::OverlayAffinityMode::TemporaryNonePositiveControl;
+        SendMessageW(
+            state.obsPositiveControlCheck,
+            BM_SETCHECK,
+            none ? BST_CHECKED : BST_UNCHECKED,
+            0);
+    }
+    if (state.obsSkipOverlayImageCheck != nullptr)
+    {
+        SendMessageW(
+            state.obsSkipOverlayImageCheck,
+            BM_SETCHECK,
+            state.obsSkipOverlayImagePresent ? BST_CHECKED : BST_UNCHECKED,
+            0);
+    }
+}
+
+void OnObsPositiveControl(ControlState& state)
+{
+    bool const checked =
+        state.obsPositiveControlCheck != nullptr &&
+        SendMessageW(state.obsPositiveControlCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    auto const mode = checked
+                          ? tracing::graphics::OverlayAffinityMode::TemporaryNonePositiveControl
+                          : tracing::graphics::OverlayAffinityMode::ExcludeFromCapture;
+    std::wstring error;
+    bool const applied = state.overlay.SetAffinityMode(mode, error);
+    SyncObsDiagnosticCheckboxes(state);
+    if (!applied)
+    {
+        SetStatusWithOverlay(
+            state,
+            L"OBS positive-control affinity failed; overlay stays hidden.\r\n" + error);
+        return;
+    }
+    if (checked)
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Temporary OBS positive-control: overlay affinity WDA_NONE. Restore exclude before "
+            L"the exclusion recording. API success is not OBS proof.");
+        return;
+    }
+    SetStatusWithOverlay(
+        state,
+        L"Restored WDA_EXCLUDEFROMCAPTURE before show (readback must be 0x11).");
+}
+
+void OnObsSkipOverlayImage(ControlState& state)
+{
+    state.obsSkipOverlayImagePresent =
+        state.obsSkipOverlayImageCheck != nullptr &&
+        SendMessageW(state.obsSkipOverlayImageCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    SetStatusWithOverlay(
+        state,
+        state.obsSkipOverlayImagePresent
+            ? L"OBS overlay test-pattern: skip image present so magenta marker stays visible "
+              L"(temporary diagnostic)."
+            : L"OBS overlay test-pattern off: imported image presents onto the overlay.");
+}
+
+void OnRecreateOverlay(ControlState& state)
+{
+    if (!state.device.IsReady())
+    {
+        SetStatusWithOverlay(state, L"Recreate overlay HWND: D3D11 device is not ready.");
+        return;
+    }
+
+    HWND const previous = state.overlay.Handle();
+    std::wstring error;
+    if (!state.overlay.Create(state.control, state.device, error))
+    {
+        SetStatusWithOverlay(state, L"Recreate overlay HWND failed.\r\n" + error);
+        return;
+    }
+    SyncObsDiagnosticCheckboxes(state);
+    wchar_t previousBuffer[32]{};
+    wchar_t nextBuffer[32]{};
+    swprintf_s(previousBuffer, L"0x%p", static_cast<void*>(previous));
+    swprintf_s(nextBuffer, L"0x%p", static_cast<void*>(state.overlay.Handle()));
+    SetStatusWithOverlay(
+        state,
+        std::wstring(L"Recreated overlay HWND ") + previousBuffer + L" -> " + nextBuffer +
+            L" (affinity reapplied before show; mode=" +
+            tracing::graphics::FormatOverlayAffinityMode(state.overlay.AffinityMode()) + L").");
+}
+
 void OnShowReference(ControlState& state)
 {
     if (!state.renderer.HasTexture())
@@ -922,9 +1029,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            348,
+            384,
             680,
-            408,
+            372,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -1142,6 +1249,47 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShowReference)),
             instance,
             nullptr);
+        created->obsPositiveControlCheck = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"OBS +ve WDA_NONE (temp)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            12,
+            348,
+            210,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdObsPositiveControl)),
+            instance,
+            nullptr);
+        SendMessageW(created->obsPositiveControlCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+        created->obsSkipOverlayImageCheck = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Skip overlay image (OBS)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            230,
+            348,
+            220,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdObsSkipOverlayImage)),
+            instance,
+            nullptr);
+        SendMessageW(created->obsSkipOverlayImageCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Recreate overlay HWND",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            458,
+            344,
+            234,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdRecreateOverlay)),
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -1257,6 +1405,21 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdShowReference && code == BN_CLICKED)
             {
                 OnShowReference(*state);
+                return 0;
+            }
+            if (id == kIdObsPositiveControl && code == BN_CLICKED)
+            {
+                OnObsPositiveControl(*state);
+                return 0;
+            }
+            if (id == kIdObsSkipOverlayImage && code == BN_CLICKED)
+            {
+                OnObsSkipOverlayImage(*state);
+                return 0;
+            }
+            if (id == kIdRecreateOverlay && code == BN_CLICKED)
+            {
+                OnRecreateOverlay(*state);
                 return 0;
             }
             if (id == kIdList && code == LBN_DBLCLK)

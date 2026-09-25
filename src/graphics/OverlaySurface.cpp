@@ -12,6 +12,9 @@
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
 #endif
+#ifndef WDA_NONE
+#define WDA_NONE 0x00000000
+#endif
 #ifndef WS_EX_NOREDIRECTIONBITMAP
 #define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
 #endif
@@ -135,8 +138,10 @@ bool OverlaySurface::Create(HWND controlWindow, DeviceResources& device, std::ws
     }
 
     contentReady_ = true;
-    ApplyExcludeFromCapture();
-    lastError_.clear();
+    if (ApplyActiveAffinity())
+    {
+        lastError_.clear();
+    }
     return true;
 }
 
@@ -248,7 +253,7 @@ void OverlaySurface::UpdatePlacementAndVisibility(
         targetUsable && lastPlacement_.width > 0 && lastPlacement_.height > 0;
     input.targetForeground = targetForeground;
     input.ownerControlForeground = ownerControlForeground;
-    input.affinityOk = AffinityIsReady(affinity_);
+    input.affinityOk = AffinityIsReadyForMode(affinity_, affinityMode_);
     input.emergencyHidden = emergencyHidden_;
     input.contentReady = contentReady_ && hwnd_ != nullptr && gpuTexture_ && stagingTexture_ &&
                          dibDc_ != nullptr && dibBits_ != nullptr;
@@ -311,6 +316,10 @@ std::wstring OverlaySurface::FormatReport() const
     text += FormatHex32(affinity_.readback);
     text += L" matchExclude=";
     text += affinity_.matchesExcludeFromCapture ? L"yes" : L"no";
+    text += L" matchNone=";
+    text += affinity_.matchesNone ? L"yes" : L"no";
+    text += L" mode=";
+    text += FormatOverlayAffinityMode(affinityMode_);
     text += L"\r\nOBS verification=";
     text += FormatObsVerification(ObsVerification());
     text += L" (API success is not OBS proof)";
@@ -528,12 +537,56 @@ bool OverlaySurface::CreateGpuSurfaces(unsigned width, unsigned height, std::wst
     return EnsureSurfaceSize(width, height, error);
 }
 
+bool OverlaySurface::SetAffinityMode(OverlayAffinityMode mode, std::wstring& error)
+{
+    error.clear();
+    affinityMode_ = mode;
+    if (hwnd_ == nullptr)
+    {
+        error = L"SetAffinityMode skipped: overlay HWND is missing.";
+        lastError_ = error;
+        return false;
+    }
+    if (!ApplyActiveAffinity())
+    {
+        error = lastError_;
+        return false;
+    }
+    lastError_.clear();
+    return true;
+}
+
+bool OverlaySurface::ApplyActiveAffinity()
+{
+    if (affinityMode_ == OverlayAffinityMode::TemporaryNonePositiveControl)
+    {
+        return ApplyNonePositiveControl();
+    }
+    return ApplyExcludeFromCapture();
+}
+
 bool OverlaySurface::ApplyExcludeFromCapture()
 {
+    return ApplyDisplayAffinity(WDA_EXCLUDEFROMCAPTURE);
+}
+
+bool OverlaySurface::ApplyNonePositiveControl()
+{
+    return ApplyDisplayAffinity(WDA_NONE);
+}
+
+bool OverlaySurface::ApplyDisplayAffinity(unsigned long affinity)
+{
+    if (hwnd_ == nullptr)
+    {
+        lastError_ = L"ApplyDisplayAffinity skipped: overlay HWND is missing.";
+        return false;
+    }
+
     affinity_ = {};
     affinity_.setCalled = true;
     SetLastError(0);
-    BOOL const setResult = SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE);
+    BOOL const setResult = SetWindowDisplayAffinity(hwnd_, affinity);
     affinity_.setLastError = GetLastError();
     affinity_.setResult = setResult != FALSE ? 1 : 0;
 
@@ -543,10 +596,20 @@ bool OverlaySurface::ApplyExcludeFromCapture()
     affinity_.readback = readback;
     affinity_.matchesExcludeFromCapture =
         affinity_.readbackSucceeded && readback == WDA_EXCLUDEFROMCAPTURE;
+    affinity_.matchesNone = affinity_.readbackSucceeded && readback == WDA_NONE;
 
-    if (!AffinityIsReady(affinity_))
+    if (!AffinityIsReadyForMode(affinity_, affinityMode_))
     {
-        lastError_ = L"WDA_EXCLUDEFROMCAPTURE failed or readback mismatch; overlay stays hidden.";
+        if (affinityMode_ == OverlayAffinityMode::TemporaryNonePositiveControl)
+        {
+            lastError_ =
+                L"WDA_NONE positive-control failed or readback mismatch; overlay stays hidden.";
+        }
+        else
+        {
+            lastError_ =
+                L"WDA_EXCLUDEFROMCAPTURE failed or readback mismatch; overlay stays hidden.";
+        }
         return false;
     }
     return true;

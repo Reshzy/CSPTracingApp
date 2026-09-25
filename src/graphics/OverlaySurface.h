@@ -39,6 +39,13 @@ enum class OverlayInteractionMode
     Alignment,
 };
 
+// Temporary OBS-gate diagnostic only. Default remains exclude-from-capture.
+enum class OverlayAffinityMode
+{
+    ExcludeFromCapture,
+    TemporaryNonePositiveControl,
+};
+
 inline LRESULT OverlayHitTestCode(OverlayInteractionMode mode) noexcept
 {
     return mode == OverlayInteractionMode::Alignment ? HTCLIENT : HTTRANSPARENT;
@@ -79,6 +86,7 @@ struct OverlayAffinityStatus
     unsigned long readback = 0;
     bool readbackSucceeded = false;
     bool matchesExcludeFromCapture = false;
+    bool matchesNone = false;
 };
 
 struct OverlayPlacement
@@ -92,6 +100,24 @@ struct OverlayPlacement
 inline bool AffinityIsReady(OverlayAffinityStatus const& status) noexcept
 {
     return status.setCalled && status.setResult != 0 && status.matchesExcludeFromCapture;
+}
+
+inline bool AffinityIsReadyForMode(
+    OverlayAffinityStatus const& status,
+    OverlayAffinityMode mode) noexcept
+{
+    if (mode == OverlayAffinityMode::TemporaryNonePositiveControl)
+    {
+        return status.setCalled && status.setResult != 0 && status.matchesNone;
+    }
+    return AffinityIsReady(status);
+}
+
+inline std::wstring FormatOverlayAffinityMode(OverlayAffinityMode mode)
+{
+    return mode == OverlayAffinityMode::TemporaryNonePositiveControl
+               ? L"temporary-none-positive-control"
+               : L"exclude-from-capture";
 }
 
 // GPU-free policy. OBS verification is not an input and cannot authorize a show.
@@ -192,6 +218,8 @@ public:
     void RequestTestPatternAt(OverlayPlacement const& placement);
     void ClearTestPattern() noexcept;
     void SetInteractionMode(OverlayInteractionMode mode);
+    bool SetAffinityMode(OverlayAffinityMode mode, std::wstring& error);
+    OverlayAffinityMode AffinityMode() const noexcept;
     void UpdatePlacementAndVisibility(
         OverlayPlacement const& placement,
         bool targetUsable,
@@ -221,6 +249,9 @@ private:
     bool CreateOverlayWindow(HINSTANCE instance, std::wstring& error);
     bool CreateGpuSurfaces(unsigned width, unsigned height, std::wstring& error);
     bool ApplyExcludeFromCapture();
+    bool ApplyNonePositiveControl();
+    bool ApplyActiveAffinity();
+    bool ApplyDisplayAffinity(unsigned long affinity);
     bool ApplyHitTestStyles();
     bool EnsureSurfaceSize(unsigned width, unsigned height, std::wstring& error);
     bool BindRenderTarget(std::wstring& error);
@@ -244,6 +275,7 @@ private:
     HGDIOBJ dibOld_ = nullptr;
     void* dibBits_ = nullptr;
     OverlayAffinityStatus affinity_{};
+    OverlayAffinityMode affinityMode_ = OverlayAffinityMode::ExcludeFromCapture;
     OverlayVisibilityResult lastVisibility_{};
     OverlayPlacement lastPlacement_{};
     unsigned surfaceWidth_ = 0;
@@ -291,6 +323,11 @@ inline bool OverlaySurface::ContentReady() const noexcept
 inline OverlayAffinityStatus const& OverlaySurface::Affinity() const noexcept
 {
     return affinity_;
+}
+
+inline OverlayAffinityMode OverlaySurface::AffinityMode() const noexcept
+{
+    return affinityMode_;
 }
 
 inline OverlayObsVerification OverlaySurface::ObsVerification() const noexcept
