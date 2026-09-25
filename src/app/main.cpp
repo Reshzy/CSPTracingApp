@@ -17,18 +17,21 @@ bool IsValidControlViewport(int width, int height) noexcept
 #ifndef TRACING_APP_TESTING
 
 #include "graphics/DeviceResources.h"
+#include "graphics/OverlaySurface.h"
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
 
 namespace {
 constexpr int kDefaultWidth = 720;
-constexpr int kDefaultHeight = 640;
+constexpr int kDefaultHeight = 760;
 constexpr wchar_t kWindowClass[] = L"TracingAppControlWindow";
 constexpr wchar_t kWindowTitle[] = L"TracingApp";
 constexpr int kIdList = 1001;
 constexpr int kIdRefresh = 1002;
 constexpr int kIdSelect = 1003;
 constexpr int kIdStatus = 1004;
+constexpr int kIdEmergencyHide = 1005;
+constexpr int kIdShowMarker = 1006;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT_PTR kTimerGeometry = 1;
 constexpr UINT kGeometryPollMs = 250;
@@ -43,6 +46,7 @@ struct ControlState
     tracing::platform::TargetLifecycleWatcher watcher;
     tracing::platform::GeometrySnapshot lastGeometry;
     tracing::graphics::DeviceResources device;
+    tracing::graphics::OverlaySurface overlay;
     std::uint64_t nextGeneration = 1;
 };
 
@@ -55,7 +59,8 @@ std::wstring ControlDpiLine(HWND hwnd)
 
 std::wstring StatusHeader(ControlState const& state)
 {
-    return ControlDpiLine(state.control) + state.device.FormatReport() + L"\r\n";
+    return ControlDpiLine(state.control) + state.device.FormatReport() + L"\r\n" +
+           state.overlay.FormatReport() + L"\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -76,16 +81,59 @@ void StopWatching(ControlState& state)
     state.lastGeometry = {};
 }
 
+void SyncOverlayFromState(ControlState& state)
+{
+    tracing::graphics::OverlayPlacement placement{};
+    bool targetUsable = false;
+    bool targetForeground = false;
+    bool const hasTarget = state.selected.has_value();
+    bool const controlForeground =
+        state.control != nullptr && GetForegroundWindow() == state.control;
+
+    if (hasTarget)
+    {
+        tracing::platform::GeometrySnapshot const& geometry = state.lastGeometry;
+        tracing::platform::OverlayEligibility const eligibility =
+            tracing::platform::ClassifyOverlayEligibility(geometry);
+        targetUsable = eligibility == tracing::platform::OverlayEligibility::Eligible ||
+                       eligibility == tracing::platform::OverlayEligibility::NotForeground;
+        targetForeground = geometry.targetForeground;
+        placement.x = geometry.clientPhysical.x;
+        placement.y = geometry.clientPhysical.y;
+        placement.width = geometry.clientPhysical.width;
+        placement.height = geometry.clientPhysical.height;
+    }
+    else if (state.overlay.TestPatternActive())
+    {
+        placement = state.overlay.LastPlacement();
+    }
+
+    std::wstring error;
+    state.overlay.UpdatePlacementAndVisibility(
+        placement,
+        targetUsable,
+        targetForeground,
+        controlForeground,
+        hasTarget,
+        error);
+}
+
+void SetStatusWithOverlay(ControlState& state, std::wstring const& body)
+{
+    SyncOverlayFromState(state);
+    if (body.empty())
+    {
+        SetStatus(state, StatusHeader(state));
+        return;
+    }
+    SetStatus(state, StatusHeader(state) + body);
+}
+
 void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
 {
-    std::wstring text = StatusHeader(state);
     if (!state.selected.has_value())
     {
-        if (!extra.empty())
-        {
-            text += extra;
-        }
-        SetStatus(state, text);
+        SetStatusWithOverlay(state, extra);
         return;
     }
 
@@ -99,37 +147,35 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
         {
             StopWatching(state);
             state.selected.reset();
-            text += error;
+            std::wstring body = error;
             if (!extra.empty())
             {
-                text += L"\r\n";
-                text += extra;
+                body += L"\r\n";
+                body += extra;
             }
-            SetStatus(state, text);
+            SetStatusWithOverlay(state, body);
             return;
         }
-        text += error;
-        text += L"\r\n";
-        text += tracing::platform::FormatGeometryReport(sampled);
+        std::wstring body = error + L"\r\n" + tracing::platform::FormatGeometryReport(sampled);
         if (!extra.empty())
         {
-            text += L"\r\n";
-            text += extra;
+            body += L"\r\n";
+            body += extra;
         }
-        SetStatus(state, text);
+        SetStatusWithOverlay(state, body);
         return;
     }
 
     sampled.geometryGeneration =
         tracing::platform::NextGeometryGeneration(state.lastGeometry, sampled);
     state.lastGeometry = sampled;
-    text += tracing::platform::FormatGeometryReport(sampled);
+    std::wstring body = tracing::platform::FormatGeometryReport(sampled);
     if (!extra.empty())
     {
-        text += L"\r\n";
-        text += extra;
+        body += L"\r\n";
+        body += extra;
     }
-    SetStatus(state, text);
+    SetStatusWithOverlay(state, body);
 }
 
 bool StartWatching(ControlState& state, std::wstring& hookError)
@@ -179,7 +225,7 @@ void RefreshCandidates(ControlState& state)
     std::wstring error;
     if (!tracing::platform::EnumerateTopLevelCandidates(state.candidates, error))
     {
-        SetStatus(state, StatusHeader(state) + error);
+        SetStatusWithOverlay(state, error);
         return;
     }
     RefillList(state);
@@ -220,33 +266,30 @@ void RefreshCandidates(ControlState& state)
         {
             StopWatching(state);
             state.selected.reset();
-            SetStatus(
+            SetStatusWithOverlay(
                 state,
-                StatusHeader(state) +
-                    L"Previous target is gone. HWND is no longer valid; geometry invalidated. "
-                    L"Select a painting window again.");
+                L"Previous target is gone. HWND is no longer valid; geometry invalidated. "
+                L"Select a painting window again.");
             return;
         }
         if (check == tracing::platform::IdentityCheck::HandleReused)
         {
             StopWatching(state);
             state.selected.reset();
-            SetStatus(
+            SetStatusWithOverlay(
                 state,
-                StatusHeader(state) +
-                    L"Previous HWND was reused by another process. Target and geometry cleared so "
-                    L"a launcher or second instance cannot silently replace it. Select again.");
+                L"Previous HWND was reused by another process. Target and geometry cleared so "
+                L"a launcher or second instance cannot silently replace it. Select again.");
             return;
         }
         if (check == tracing::platform::IdentityCheck::AccessFailed)
         {
-            SetStatus(
+            SetStatusWithOverlay(
                 state,
-                StatusHeader(state) +
-                    (accessError.empty()
-                         ? tracing::platform::FormatAccessFailure(
-                               stored.process.pid, ERROR_ACCESS_DENIED)
-                         : accessError));
+                accessError.empty()
+                    ? tracing::platform::FormatAccessFailure(
+                          stored.process.pid, ERROR_ACCESS_DENIED)
+                    : accessError);
             return;
         }
 
@@ -254,11 +297,10 @@ void RefreshCandidates(ControlState& state)
         return;
     }
 
-    SetStatus(
+    SetStatusWithOverlay(
         state,
-        StatusHeader(state) +
-            L"Refreshed top-level windows. Select a PAINT row (CLIPStudioPaint.exe), then Select. "
-            L"Launcher rows are never chosen automatically.");
+        L"Refreshed top-level windows. Select a PAINT row (CLIPStudioPaint.exe), then Select. "
+        L"Launcher rows are never chosen automatically.");
 }
 
 void SelectFromUi(ControlState& state)
@@ -280,7 +322,7 @@ void SelectFromUi(ControlState& state)
         state.nextGeneration);
     if (selection.status != tracing::platform::SelectionStatus::Selected)
     {
-        SetStatus(state, StatusHeader(state) + selection.message);
+        SetStatusWithOverlay(state, selection.message);
         return;
     }
 
@@ -297,6 +339,31 @@ void SelectFromUi(ControlState& state)
         extra += hookError;
     }
     RefreshGeometryDisplay(state, extra);
+}
+
+void OnEmergencyHide(ControlState& state)
+{
+    state.overlay.EmergencyHide();
+    SetStatusWithOverlay(
+        state,
+        L"Emergency hide latched. Overlay stays hidden until Show test marker.");
+}
+
+void OnShowTestMarker(ControlState& state)
+{
+    state.overlay.ClearEmergencyHide();
+    if (!state.selected.has_value())
+    {
+        state.overlay.RequestTestPattern();
+        SetStatusWithOverlay(
+            state,
+            L"Show test marker: test-pattern surface (not imported image).");
+        return;
+    }
+    state.overlay.ClearTestPattern();
+    RefreshGeometryDisplay(
+        state,
+        L"Show test marker: using selected target client physical bounds.");
 }
 
 LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -319,7 +386,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             12,
             12,
             680,
-            240,
+            200,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdList)),
             instance,
@@ -330,9 +397,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            296,
+            256,
             680,
-            290,
+            460,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -343,7 +410,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"Refresh",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             12,
-            260,
+            220,
             100,
             28,
             hwnd,
@@ -356,11 +423,37 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"Select",
             WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             124,
-            260,
+            220,
             100,
             28,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSelect)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Emergency Hide",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            236,
+            220,
+            140,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdEmergencyHide)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Show test marker",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            384,
+            220,
+            150,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdShowMarker)),
             instance,
             nullptr);
         std::wstring deviceError;
@@ -368,6 +461,15 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         {
             OutputDebugStringW(deviceError.c_str());
             OutputDebugStringW(L"\r\n");
+        }
+        else
+        {
+            std::wstring overlayError;
+            if (!created->overlay.Create(hwnd, created->device, overlayError))
+            {
+                OutputDebugStringW(overlayError.c_str());
+                OutputDebugStringW(L"\r\n");
+            }
         }
         RefreshCandidates(*created);
         return 0;
@@ -385,6 +487,16 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdSelect && code == BN_CLICKED)
             {
                 SelectFromUi(*state);
+                return 0;
+            }
+            if (id == kIdEmergencyHide && code == BN_CLICKED)
+            {
+                OnEmergencyHide(*state);
+                return 0;
+            }
+            if (id == kIdShowMarker && code == BN_CLICKED)
+            {
+                OnShowTestMarker(*state);
                 return 0;
             }
             if (id == kIdList && code == LBN_DBLCLK)
@@ -418,6 +530,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (state != nullptr)
         {
             StopWatching(*state);
+            state->overlay.Release();
             state->device.Release();
             delete state;
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
