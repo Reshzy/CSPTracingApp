@@ -6,8 +6,8 @@
 
 #include <d3d11.h>
 
-#include <cstring>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -66,25 +66,6 @@ std::wstring ModuleDirectory()
     return path.substr(0, slash);
 }
 
-std::uint64_t QueryCounter() noexcept
-{
-    LARGE_INTEGER value{};
-    QueryPerformanceCounter(&value);
-    return static_cast<std::uint64_t>(value.QuadPart);
-}
-
-unsigned long CounterToMicroseconds(std::uint64_t start, std::uint64_t end) noexcept
-{
-    LARGE_INTEGER frequency{};
-    QueryPerformanceFrequency(&frequency);
-    if (frequency.QuadPart <= 0 || end < start)
-    {
-        return 0;
-    }
-    return static_cast<unsigned long>(
-        ((end - start) * 1000000ull) / static_cast<std::uint64_t>(frequency.QuadPart));
-}
-
 } // namespace
 
 ImageRenderer::~ImageRenderer()
@@ -131,8 +112,6 @@ bool ImageRenderer::Create(DeviceResources& device, std::wstring& error)
 
 void ImageRenderer::Release()
 {
-    ReleasePresentSurfaces();
-    ReleaseDib();
     ReleaseTexture();
     constants_.Reset();
     rasterizer_.Reset();
@@ -141,10 +120,6 @@ void ImageRenderer::Release()
     pixelShader_.Reset();
     vertexShader_.Reset();
     device_ = nullptr;
-    presentWidth_ = 0;
-    presentHeight_ = 0;
-    lastReadbackUs_ = 0;
-    lastUlwUs_ = 0;
 }
 
 bool ImageRenderer::Upload(tracing::image::DecodedImage const& image, std::wstring& error)
@@ -238,13 +213,13 @@ bool ImageRenderer::Upload(tracing::image::DecodedImage const& image, std::wstri
 }
 
 bool ImageRenderer::DrawAndPresent(
-    HWND overlay,
+    OverlaySurface& overlay,
     OverlayPlacement const& overlayPlacement,
     OverlayInteractionMode mode,
     std::wstring& error)
 {
     error.clear();
-    if (overlay == nullptr)
+    if (overlay.Handle() == nullptr)
     {
         lastHr_ = E_INVALIDARG;
         error = L"ImageRenderer::DrawAndPresent needs the overlay HWND.";
@@ -268,8 +243,16 @@ bool ImageRenderer::DrawAndPresent(
 
     unsigned const width = static_cast<unsigned>(overlayPlacement.width);
     unsigned const height = static_cast<unsigned>(overlayPlacement.height);
-    if (!EnsurePresentSize(width, height, error))
+    if (!overlay.EnsurePresentSize(width, height, error))
     {
+        lastHr_ = E_FAIL;
+        lastError_ = error;
+        return false;
+    }
+    if (overlay.RenderTargetView() == nullptr)
+    {
+        lastHr_ = E_FAIL;
+        error = L"ImageRenderer::DrawAndPresent skipped: overlay RTV missing.";
         lastError_ = error;
         return false;
     }
@@ -279,14 +262,15 @@ bool ImageRenderer::DrawAndPresent(
     {
         clear[3] = 32.0f / 255.0f;
     }
-    if (!DrawToRtv(rtv_.Get(), width, height, placement_, opacity_, clear, error))
+    if (!DrawToRtv(overlay.RenderTargetView(), width, height, placement_, opacity_, clear, error))
     {
         lastError_ = error;
         return false;
     }
 
-    if (!PresentLayered(overlay, overlayPlacement, error))
+    if (!overlay.Present(error))
     {
+        lastHr_ = E_FAIL;
         lastError_ = error;
         return false;
     }
@@ -431,10 +415,7 @@ std::wstring ImageRenderer::FormatReport() const
     text += L" (explicit; texture unchanged by fit/reset/opacity)";
     text += L"\r\nlastHr=";
     text += FormatHresult(lastHr_);
-    text += L" readbackUs=";
-    text += std::to_wstring(lastReadbackUs_);
-    text += L" ulwUs=";
-    text += std::to_wstring(lastUlwUs_);
+    text += L" present=overlay-dxgi-hwnd";
     text += L" vs=";
     text += vsPath_.empty() ? L"(none)" : vsPath_;
     if (!lastError_.empty())
@@ -576,211 +557,6 @@ bool ImageRenderer::LoadShaderFile(
         return false;
     }
     return true;
-}
-
-bool ImageRenderer::EnsurePresentSize(unsigned width, unsigned height, std::wstring& error)
-{
-    if (width == 0 || height == 0 || width > kMaxDimension || height > kMaxDimension)
-    {
-        lastHr_ = E_INVALIDARG;
-        error = L"ImageRenderer present size is invalid.";
-        return false;
-    }
-    if (presentTexture_ && stagingTexture_ && rtv_ && dibDc_ != nullptr && dibBits_ != nullptr &&
-        width == presentWidth_ && height == presentHeight_)
-    {
-        return true;
-    }
-
-    ReleasePresentSurfaces();
-    ReleaseDib();
-
-    HDC const screen = GetDC(nullptr);
-    if (screen == nullptr)
-    {
-        unsigned long const code = GetLastError();
-        lastHr_ = HRESULT_FROM_WIN32(code);
-        error = L"GetDC for image DIB failed (Win32 " + std::to_wstring(code) + L").";
-        return false;
-    }
-    dibDc_ = CreateCompatibleDC(screen);
-    ReleaseDC(nullptr, screen);
-    if (dibDc_ == nullptr)
-    {
-        unsigned long const code = GetLastError();
-        lastHr_ = HRESULT_FROM_WIN32(code);
-        error = L"CreateCompatibleDC image DIB failed (Win32 " + std::to_wstring(code) + L").";
-        return false;
-    }
-
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = static_cast<LONG>(width);
-    info.bmiHeader.biHeight = -static_cast<LONG>(height);
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-    dibBitmap_ = CreateDIBSection(dibDc_, &info, DIB_RGB_COLORS, &dibBits_, nullptr, 0);
-    if (dibBitmap_ == nullptr || dibBits_ == nullptr)
-    {
-        unsigned long const code = GetLastError();
-        ReleaseDib();
-        lastHr_ = HRESULT_FROM_WIN32(code);
-        error = L"CreateDIBSection image present failed (Win32 " + std::to_wstring(code) + L").";
-        return false;
-    }
-    dibOld_ = SelectObject(dibDc_, dibBitmap_);
-
-    D3D11_TEXTURE2D_DESC gpu{};
-    gpu.Width = width;
-    gpu.Height = height;
-    gpu.MipLevels = 1;
-    gpu.ArraySize = 1;
-    gpu.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    gpu.SampleDesc.Count = 1;
-    gpu.Usage = D3D11_USAGE_DEFAULT;
-    gpu.BindFlags = D3D11_BIND_RENDER_TARGET;
-    HRESULT hr = device_->Device()->CreateTexture2D(&gpu, nullptr, &presentTexture_);
-    if (FAILED(hr) || !presentTexture_)
-    {
-        lastHr_ = hr;
-        error = L"CreateTexture2D image present target failed " + FormatHresult(hr) + L".";
-        ReleasePresentSurfaces();
-        ReleaseDib();
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC staging = gpu;
-    staging.Usage = D3D11_USAGE_STAGING;
-    staging.BindFlags = 0;
-    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    hr = device_->Device()->CreateTexture2D(&staging, nullptr, &stagingTexture_);
-    if (FAILED(hr) || !stagingTexture_)
-    {
-        lastHr_ = hr;
-        error = L"CreateTexture2D image staging failed " + FormatHresult(hr) + L".";
-        ReleasePresentSurfaces();
-        ReleaseDib();
-        return false;
-    }
-
-    hr = device_->Device()->CreateRenderTargetView(presentTexture_.Get(), nullptr, &rtv_);
-    if (FAILED(hr) || !rtv_)
-    {
-        lastHr_ = hr;
-        error = L"CreateRenderTargetView image present failed " + FormatHresult(hr) + L".";
-        ReleasePresentSurfaces();
-        ReleaseDib();
-        return false;
-    }
-
-    presentWidth_ = width;
-    presentHeight_ = height;
-    lastHr_ = S_OK;
-    return true;
-}
-
-bool ImageRenderer::PresentLayered(
-    HWND overlay,
-    OverlayPlacement const& overlayPlacement,
-    std::wstring& error)
-{
-    if (!device_ || !presentTexture_ || !stagingTexture_ || dibDc_ == nullptr || dibBits_ == nullptr ||
-        overlay == nullptr)
-    {
-        lastHr_ = E_FAIL;
-        error = L"Image layered present skipped: resources missing.";
-        return false;
-    }
-
-    ID3D11DeviceContext* const context = device_->ImmediateContext();
-    std::uint64_t const readbackStart = QueryCounter();
-    context->CopyResource(stagingTexture_.Get(), presentTexture_.Get());
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = context->Map(stagingTexture_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr))
-    {
-        lastHr_ = hr;
-        error = L"Map image staging failed " + FormatHresult(hr) + L".";
-        return false;
-    }
-
-    unsigned const rowBytes = presentWidth_ * kBytesPerPixel;
-    auto* dest = static_cast<std::uint8_t*>(dibBits_);
-    auto const* src = static_cast<std::uint8_t const*>(mapped.pData);
-    for (unsigned y = 0; y < presentHeight_; ++y)
-    {
-        std::memcpy(
-            dest + (static_cast<size_t>(y) * rowBytes),
-            src + (static_cast<size_t>(y) * mapped.RowPitch),
-            rowBytes);
-    }
-    context->Unmap(stagingTexture_.Get(), 0);
-    lastReadbackUs_ = CounterToMicroseconds(readbackStart, QueryCounter());
-
-    POINT destination{overlayPlacement.x, overlayPlacement.y};
-    POINT source{0, 0};
-    SIZE size{
-        static_cast<LONG>(presentWidth_),
-        static_cast<LONG>(presentHeight_)};
-    BLENDFUNCTION blend{};
-    blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
-    blend.AlphaFormat = AC_SRC_ALPHA;
-
-    std::uint64_t const ulwStart = QueryCounter();
-    SetLastError(0);
-    BOOL const updated = UpdateLayeredWindow(
-        overlay,
-        nullptr,
-        &destination,
-        &size,
-        dibDc_,
-        &source,
-        0,
-        &blend,
-        ULW_ALPHA);
-    lastUlwUs_ = CounterToMicroseconds(ulwStart, QueryCounter());
-    if (updated == FALSE)
-    {
-        unsigned long const code = GetLastError();
-        lastHr_ = HRESULT_FROM_WIN32(code);
-        error = L"UpdateLayeredWindow image present failed (Win32 " + std::to_wstring(code) + L").";
-        return false;
-    }
-
-    lastHr_ = S_OK;
-    return true;
-}
-
-void ImageRenderer::ReleasePresentSurfaces() noexcept
-{
-    rtv_.Reset();
-    stagingTexture_.Reset();
-    presentTexture_.Reset();
-    presentWidth_ = 0;
-    presentHeight_ = 0;
-}
-
-void ImageRenderer::ReleaseDib() noexcept
-{
-    if (dibDc_ != nullptr && dibOld_ != nullptr)
-    {
-        SelectObject(dibDc_, dibOld_);
-        dibOld_ = nullptr;
-    }
-    if (dibBitmap_ != nullptr)
-    {
-        DeleteObject(dibBitmap_);
-        dibBitmap_ = nullptr;
-    }
-    if (dibDc_ != nullptr)
-    {
-        DeleteDC(dibDc_);
-        dibDc_ = nullptr;
-    }
-    dibBits_ = nullptr;
 }
 
 void ImageRenderer::ReleaseTexture() noexcept

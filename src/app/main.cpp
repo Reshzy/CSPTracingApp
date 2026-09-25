@@ -171,6 +171,7 @@ std::wstring StatusHeader(ControlState const& state)
            state.image.FormatReport() + L"\r\n" +
            state.renderer.FormatReport() + L"\r\n" +
            state.reference.FormatReport() + L"\r\n" +
+           L"overlayPresentPath=dxgi-hwnd (not ulw, not dcomp; OBS verification is user-recorded)\r\n"
            L"overlayHiddenOnCaptureLoss=" +
            std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") +
            L" obsSkipOverlayImagePresent=" +
@@ -264,7 +265,7 @@ void SyncOverlayFromState(ControlState& state)
     {
         std::wstring presentError;
         if (!state.renderer.DrawAndPresent(
-                state.overlay.Handle(),
+                state.overlay,
                 state.overlay.LastPlacement(),
                 state.overlay.InteractionMode(),
                 presentError) &&
@@ -817,8 +818,8 @@ void OnObsPositiveControl(ControlState& state)
     {
         SetStatusWithOverlay(
             state,
-            L"Temporary OBS positive-control: overlay affinity WDA_NONE. Restore exclude before "
-            L"the exclusion recording. API success is not OBS proof.");
+            L"Temporary OBS positive-control: overlay affinity WDA_NONE, presentPath=dxgi-hwnd. "
+            L"Restore exclude before the exclusion recording. API success is not OBS proof.");
         return;
     }
     SetStatusWithOverlay(

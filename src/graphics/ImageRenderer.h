@@ -61,8 +61,8 @@ inline ImagePlacement FitPlacement(
 }
 
 // Uploads a 32bppPBGRA CPU buffer once to an immutable texture and draws a
-// textured quad onto the existing layered overlay HWND. Placement/opacity update
-// constants only. Borrows DeviceResources on the graphics owner thread.
+// textured quad onto the overlay DXGI HWND swap-chain RTV. Placement/opacity
+// update constants only. Borrows DeviceResources on the graphics owner thread.
 class ImageRenderer
 {
 public:
@@ -78,7 +78,7 @@ public:
     void Release();
     bool Upload(tracing::image::DecodedImage const& image, std::wstring& error);
     bool DrawAndPresent(
-        HWND overlay,
+        OverlaySurface& overlay,
         OverlayPlacement const& overlayPlacement,
         OverlayInteractionMode mode,
         std::wstring& error);
@@ -114,10 +114,6 @@ private:
         float opacity,
         float const clearColor[4],
         std::wstring& error);
-    bool EnsurePresentSize(unsigned width, unsigned height, std::wstring& error);
-    bool PresentLayered(HWND overlay, OverlayPlacement const& overlayPlacement, std::wstring& error);
-    void ReleasePresentSurfaces() noexcept;
-    void ReleaseDib() noexcept;
     void ReleaseTexture() noexcept;
 
     DeviceResources* device_ = nullptr;
@@ -129,23 +125,12 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Buffer> constants_;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> presentTexture_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTexture_;
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv_;
-    HDC dibDc_ = nullptr;
-    HBITMAP dibBitmap_ = nullptr;
-    HGDIOBJ dibOld_ = nullptr;
-    void* dibBits_ = nullptr;
-    unsigned presentWidth_ = 0;
-    unsigned presentHeight_ = 0;
     int textureWidth_ = 0;
     int textureHeight_ = 0;
     unsigned textureGeneration_ = 0;
     float opacity_ = 1.0f;
     ImagePlacement placement_{};
     HRESULT lastHr_ = S_OK;
-    unsigned long lastReadbackUs_ = 0;
-    unsigned long lastUlwUs_ = 0;
     std::wstring lastError_;
     std::wstring vsPath_;
     std::wstring psPath_;

@@ -5,8 +5,9 @@
 #include "graphics/OverlaySurface.h"
 
 #include <d3d11_1.h>
+#include <dwmapi.h>
 
-#include <cstring>
+#include <algorithm>
 #include <cstdio>
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
@@ -35,14 +36,8 @@ namespace {
 constexpr wchar_t kOverlayClass[] = L"TracingAppOverlayWindow";
 constexpr unsigned kDefaultWidth = 240;
 constexpr unsigned kDefaultHeight = 160;
-constexpr unsigned kMagentaWidth = 96;
-constexpr unsigned kMagentaHeight = 40;
-constexpr unsigned kMagentaX = 16;
-constexpr unsigned kMagentaY = 24;
-constexpr unsigned kYellowWidth = 32;
-constexpr unsigned kYellowHeight = 48;
-constexpr unsigned kYellowX = 16;
-constexpr unsigned kYellowY = 64;
+constexpr unsigned kMarkerOriginX = 24;
+constexpr unsigned kMarkerOriginY = 32;
 constexpr unsigned kMaxDimension = 16384;
 
 std::wstring FormatHresult(HRESULT value)
@@ -100,6 +95,20 @@ unsigned long CounterToMicroseconds(std::uint64_t start, std::uint64_t end) noex
         ((end - start) * 1000000ull) / static_cast<std::uint64_t>(frequency.QuadPart));
 }
 
+void FillSwapDesc(DXGI_SWAP_CHAIN_DESC1& desc, unsigned width, unsigned height, DXGI_ALPHA_MODE alpha)
+{
+    desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    desc.BufferCount = 2;
+    desc.Scaling = DXGI_SCALING_STRETCH;
+    desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.AlphaMode = alpha;
+}
+
 } // namespace
 
 OverlaySurface::~OverlaySurface()
@@ -130,7 +139,8 @@ bool OverlaySurface::Create(HWND controlWindow, DeviceResources& device, std::ws
         return false;
     }
 
-    if (!CreateGpuSurfaces(kDefaultWidth, kDefaultHeight, error))
+    if (!CreateDxgiFactory(error) || !ApplyLayeredRedirection(error) ||
+        !EnsurePresentSize(kDefaultWidth, kDefaultHeight, error))
     {
         lastError_ = error;
         Release();
@@ -150,8 +160,8 @@ void OverlaySurface::Release()
     HideWindowOnly();
     contentReady_ = false;
     visible_ = false;
-    ReleaseGpuSurfaces();
-    ReleaseDib();
+    ReleaseSwapChain();
+    factory_.Reset();
     if (hwnd_ != nullptr)
     {
         DestroyWindow(hwnd_);
@@ -162,12 +172,15 @@ void OverlaySurface::Release()
     affinity_ = {};
     lastVisibility_ = {};
     lastPlacement_ = {};
+    alphaMode_ = OverlayPresentAlphaMode::Unspecified;
     lastPresentResult_ = S_OK;
-    lastReadbackUs_ = 0;
-    lastUlwUs_ = 0;
+    premulCreateHr_ = S_OK;
+    ignoreCreateHr_ = S_OK;
+    lastPresentUs_ = 0;
     emergencyHidden_ = false;
     testPatternActive_ = false;
     topmostWhileShown_ = false;
+    dwmExtendedFrame_ = false;
     mode_ = OverlayInteractionMode::Tracing;
     consumedMouseDown_ = 0;
     consumedWheel_ = 0;
@@ -255,8 +268,7 @@ void OverlaySurface::UpdatePlacementAndVisibility(
     input.ownerControlForeground = ownerControlForeground;
     input.affinityOk = AffinityIsReadyForMode(affinity_, affinityMode_);
     input.emergencyHidden = emergencyHidden_;
-    input.contentReady = contentReady_ && hwnd_ != nullptr && gpuTexture_ && stagingTexture_ &&
-                         dibDc_ != nullptr && dibBits_ != nullptr;
+    input.contentReady = contentReady_ && hwnd_ != nullptr && swapChain_ && rtv_;
     input.testPatternWithoutTarget = testPatternActive_ && !hasTarget;
     lastVisibility_ = DecideOverlayVisibility(input);
 
@@ -268,7 +280,16 @@ void OverlaySurface::UpdatePlacementAndVisibility(
 
     unsigned width = static_cast<unsigned>(lastPlacement_.width);
     unsigned height = static_cast<unsigned>(lastPlacement_.height);
-    if (!EnsureSurfaceSize(width, height, error) || !DrawMarker(error))
+    SetWindowPos(
+        hwnd_,
+        HWND_TOPMOST,
+        lastPlacement_.x,
+        lastPlacement_.y,
+        lastPlacement_.width,
+        lastPlacement_.height,
+        SWP_NOACTIVATE);
+    topmostWhileShown_ = true;
+    if (!EnsurePresentSize(width, height, error) || !DrawMarker(error))
     {
         lastError_ = error;
         HideWindowOnly();
@@ -368,12 +389,18 @@ std::wstring OverlaySurface::FormatReport() const
     text += std::to_wstring(virtualW);
     text += L"x";
     text += std::to_wstring(virtualH);
+    text += L"\r\npresentPath=dxgi-hwnd (not ulw, not dcomp) alphaMode=";
+    text += FormatOverlayPresentAlphaMode(alphaMode_);
+    text += L" premulCreateHr=";
+    text += FormatHresult(premulCreateHr_);
+    text += L" ignoreCreateHr=";
+    text += FormatHresult(ignoreCreateHr_);
+    text += L" dwmExtendFrame=";
+    text += dwmExtendedFrame_ ? L"yes" : L"no";
     text += L" present=";
     text += FormatHresult(lastPresentResult_);
-    text += L" readbackUs=";
-    text += std::to_wstring(lastReadbackUs_);
-    text += L" ulwUs=";
-    text += std::to_wstring(lastUlwUs_);
+    text += L" presentUs=";
+    text += std::to_wstring(lastPresentUs_);
     if (!lastError_.empty())
     {
         text += L"\r\noverlay error: ";
@@ -430,6 +457,77 @@ bool OverlaySurface::CreateOverlayWindow(HINSTANCE instance, std::wstring& error
     return ApplyHitTestStyles();
 }
 
+bool OverlaySurface::ApplyLayeredRedirection(std::wstring& error)
+{
+    if (hwnd_ == nullptr)
+    {
+        error = L"SetLayeredWindowAttributes skipped: overlay HWND is missing.";
+        return false;
+    }
+    SetLastError(0);
+    if (SetLayeredWindowAttributes(hwnd_, 0, 255, LWA_ALPHA) == FALSE)
+    {
+        unsigned long const code = GetLastError();
+        error = L"SetLayeredWindowAttributes(LWA_ALPHA) failed (Win32 " + std::to_wstring(code) +
+                L").";
+        return false;
+    }
+    return true;
+}
+
+bool OverlaySurface::ApplyDwmExtendedFrame(std::wstring& error)
+{
+    if (hwnd_ == nullptr)
+    {
+        error = L"DwmExtendFrameIntoClientArea skipped: overlay HWND is missing.";
+        return false;
+    }
+    MARGINS const margins{-1, -1, -1, -1};
+    HRESULT const hr = DwmExtendFrameIntoClientArea(hwnd_, &margins);
+    if (FAILED(hr))
+    {
+        error = L"DwmExtendFrameIntoClientArea failed " + FormatHresult(hr) + L".";
+        dwmExtendedFrame_ = false;
+        return false;
+    }
+    dwmExtendedFrame_ = true;
+    return true;
+}
+
+bool OverlaySurface::CreateDxgiFactory(std::wstring& error)
+{
+    if (!device_ || device_->Device() == nullptr)
+    {
+        error = L"Overlay DXGI factory needs a ready D3D11 device.";
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
+    HRESULT hr = device_->Device()->QueryInterface(IID_PPV_ARGS(&dxgiDevice));
+    if (FAILED(hr) || !dxgiDevice)
+    {
+        error = L"QueryInterface IDXGIDevice overlay failed " + FormatHresult(hr) + L".";
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
+    hr = dxgiDevice->GetAdapter(&adapter);
+    if (FAILED(hr) || !adapter)
+    {
+        error = L"IDXGIDevice::GetAdapter overlay failed " + FormatHresult(hr) + L".";
+        return false;
+    }
+
+    factory_.Reset();
+    hr = adapter->GetParent(IID_PPV_ARGS(&factory_));
+    if (FAILED(hr) || !factory_)
+    {
+        error = L"IDXGIAdapter::GetParent IDXGIFactory2 overlay failed " + FormatHresult(hr) + L".";
+        return false;
+    }
+    return true;
+}
+
 bool OverlaySurface::ApplyHitTestStyles()
 {
     if (hwnd_ == nullptr)
@@ -438,6 +536,7 @@ bool OverlaySurface::ApplyHitTestStyles()
     }
 
     LONG_PTR ex = GetWindowLongPtrW(hwnd_, GWL_EXSTYLE);
+    ex &= ~static_cast<LONG_PTR>(WS_EX_NOREDIRECTIONBITMAP);
     ex |= WS_EX_LAYERED;
     if (OverlayUsesTransparentExStyle(mode_))
     {
@@ -456,6 +555,12 @@ bool OverlaySurface::ApplyHitTestStyles()
         0,
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    std::wstring layeredError;
+    ApplyLayeredRedirection(layeredError);
+    if (!layeredError.empty())
+    {
+        lastError_ = layeredError;
+    }
     return true;
 }
 
@@ -530,11 +635,6 @@ LRESULT CALLBACK OverlaySurface::WndProc(HWND hwnd, UINT message, WPARAM wParam,
     default:
         return DefWindowProcW(hwnd, message, wParam, lParam);
     }
-}
-
-bool OverlaySurface::CreateGpuSurfaces(unsigned width, unsigned height, std::wstring& error)
-{
-    return EnsureSurfaceSize(width, height, error);
 }
 
 bool OverlaySurface::SetAffinityMode(OverlayAffinityMode mode, std::wstring& error)
@@ -615,157 +715,145 @@ bool OverlaySurface::ApplyDisplayAffinity(unsigned long affinity)
     return true;
 }
 
-void OverlaySurface::ReleaseGpuSurfaces() noexcept
+void OverlaySurface::UnbindContextTargets() noexcept
 {
+    if (device_ == nullptr || device_->ImmediateContext() == nullptr)
+    {
+        return;
+    }
+    ID3D11RenderTargetView* none[] = {nullptr};
+    device_->ImmediateContext()->OMSetRenderTargets(0, none, nullptr);
+}
+
+void OverlaySurface::ReleaseSwapChain() noexcept
+{
+    UnbindContextTargets();
     rtv_.Reset();
-    stagingTexture_.Reset();
-    gpuTexture_.Reset();
+    swapChain_.Reset();
     surfaceWidth_ = 0;
     surfaceHeight_ = 0;
 }
 
-void OverlaySurface::ReleaseDib() noexcept
+bool OverlaySurface::EnsurePresentSize(unsigned width, unsigned height, std::wstring& error)
 {
-    if (dibDc_ != nullptr && dibOld_ != nullptr)
-    {
-        SelectObject(dibDc_, dibOld_);
-        dibOld_ = nullptr;
-    }
-    if (dibBitmap_ != nullptr)
-    {
-        DeleteObject(dibBitmap_);
-        dibBitmap_ = nullptr;
-    }
-    if (dibDc_ != nullptr)
-    {
-        DeleteDC(dibDc_);
-        dibDc_ = nullptr;
-    }
-    dibBits_ = nullptr;
+    return EnsureSwapChain(width, height, error);
 }
 
-bool OverlaySurface::EnsureDib(unsigned width, unsigned height, std::wstring& error)
-{
-    if (dibDc_ != nullptr && dibBits_ != nullptr && dibBitmap_ != nullptr && width == surfaceWidth_ &&
-        height == surfaceHeight_)
-    {
-        return true;
-    }
-
-    ReleaseDib();
-
-    HDC const screen = GetDC(nullptr);
-    if (screen == nullptr)
-    {
-        error = L"GetDC for layered DIB failed (Win32 " + std::to_wstring(GetLastError()) + L").";
-        return false;
-    }
-    dibDc_ = CreateCompatibleDC(screen);
-    ReleaseDC(nullptr, screen);
-    if (dibDc_ == nullptr)
-    {
-        error = L"CreateCompatibleDC failed (Win32 " + std::to_wstring(GetLastError()) + L").";
-        return false;
-    }
-
-    BITMAPINFO info{};
-    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    info.bmiHeader.biWidth = static_cast<LONG>(width);
-    info.bmiHeader.biHeight = -static_cast<LONG>(height);
-    info.bmiHeader.biPlanes = 1;
-    info.bmiHeader.biBitCount = 32;
-    info.bmiHeader.biCompression = BI_RGB;
-
-    dibBitmap_ = CreateDIBSection(dibDc_, &info, DIB_RGB_COLORS, &dibBits_, nullptr, 0);
-    if (dibBitmap_ == nullptr || dibBits_ == nullptr)
-    {
-        unsigned long const code = GetLastError();
-        ReleaseDib();
-        error = L"CreateDIBSection failed (Win32 " + std::to_wstring(code) + L").";
-        return false;
-    }
-    dibOld_ = SelectObject(dibDc_, dibBitmap_);
-    return true;
-}
-
-bool OverlaySurface::EnsureSurfaceSize(unsigned width, unsigned height, std::wstring& error)
+bool OverlaySurface::EnsureSwapChain(unsigned width, unsigned height, std::wstring& error)
 {
     if (width == 0 || height == 0 || width > kMaxDimension || height > kMaxDimension)
     {
         error = L"Overlay size is invalid.";
         return false;
     }
-    if (gpuTexture_ && stagingTexture_ && rtv_ && dibDc_ != nullptr && dibBits_ != nullptr &&
-        width == surfaceWidth_ && height == surfaceHeight_)
+    if (swapChain_ && rtv_ && width == surfaceWidth_ && height == surfaceHeight_)
     {
         return true;
     }
 
-    ReleaseGpuSurfaces();
-    if (!EnsureDib(width, height, error))
+    if (!device_ || device_->Device() == nullptr || !factory_ || hwnd_ == nullptr)
     {
+        error = L"Overlay swap chain needs a ready D3D11 device, factory, and HWND.";
         return false;
     }
 
-    if (!device_ || device_->Device() == nullptr)
+    UnbindContextTargets();
+    rtv_.Reset();
+
+    if (!swapChain_)
     {
-        error = L"Overlay GPU surfaces need a ready D3D11 device.";
-        return false;
+        DXGI_SWAP_CHAIN_DESC1 desc{};
+        FillSwapDesc(desc, width, height, DXGI_ALPHA_MODE_PREMULTIPLIED);
+        premulCreateHr_ = factory_->CreateSwapChainForHwnd(
+            device_->Device(),
+            hwnd_,
+            &desc,
+            nullptr,
+            nullptr,
+            &swapChain_);
+        if (FAILED(premulCreateHr_) || !swapChain_)
+        {
+            swapChain_.Reset();
+            FillSwapDesc(desc, width, height, DXGI_ALPHA_MODE_IGNORE);
+            ignoreCreateHr_ = factory_->CreateSwapChainForHwnd(
+                device_->Device(),
+                hwnd_,
+                &desc,
+                nullptr,
+                nullptr,
+                &swapChain_);
+            if (FAILED(ignoreCreateHr_) || !swapChain_)
+            {
+                error = L"CreateSwapChainForHwnd overlay failed premul=" +
+                        FormatHresult(premulCreateHr_) + L" ignore=" +
+                        FormatHresult(ignoreCreateHr_) +
+                        L". Layered DXGI HWND path stopped; do not mix DComp.";
+                ReleaseSwapChain();
+                alphaMode_ = OverlayPresentAlphaMode::Unspecified;
+                return false;
+            }
+            alphaMode_ = OverlayPresentAlphaMode::Ignore;
+            std::wstring dwmError;
+            if (!ApplyDwmExtendedFrame(dwmError))
+            {
+                lastError_ = dwmError;
+            }
+        }
+        else
+        {
+            ignoreCreateHr_ = S_OK;
+            alphaMode_ = OverlayPresentAlphaMode::Premultiplied;
+        }
+
+        factory_->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
     }
-
-    D3D11_TEXTURE2D_DESC gpu{};
-    gpu.Width = width;
-    gpu.Height = height;
-    gpu.MipLevels = 1;
-    gpu.ArraySize = 1;
-    gpu.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    gpu.SampleDesc.Count = 1;
-    gpu.Usage = D3D11_USAGE_DEFAULT;
-    gpu.BindFlags = D3D11_BIND_RENDER_TARGET;
-
-    HRESULT hr = device_->Device()->CreateTexture2D(&gpu, nullptr, &gpuTexture_);
-    if (FAILED(hr) || !gpuTexture_)
+    else
     {
-        error = L"CreateTexture2D overlay GPU target failed " + FormatHresult(hr) + L".";
-        ReleaseGpuSurfaces();
-        return false;
-    }
-
-    D3D11_TEXTURE2D_DESC staging = gpu;
-    staging.Usage = D3D11_USAGE_STAGING;
-    staging.BindFlags = 0;
-    staging.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    hr = device_->Device()->CreateTexture2D(&staging, nullptr, &stagingTexture_);
-    if (FAILED(hr) || !stagingTexture_)
-    {
-        error = L"CreateTexture2D overlay staging failed " + FormatHresult(hr) + L".";
-        ReleaseGpuSurfaces();
-        return false;
+        HRESULT const hr = swapChain_->ResizeBuffers(
+            2,
+            width,
+            height,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            0);
+        if (FAILED(hr))
+        {
+            error = L"ResizeBuffers overlay failed " + FormatHresult(hr) + L".";
+            ReleaseSwapChain();
+            return false;
+        }
     }
 
     surfaceWidth_ = width;
     surfaceHeight_ = height;
-    if (!BindRenderTarget(error))
+    if (!BindBackBufferRtv(error))
     {
-        ReleaseGpuSurfaces();
+        ReleaseSwapChain();
         return false;
     }
     return true;
 }
 
-bool OverlaySurface::BindRenderTarget(std::wstring& error)
+bool OverlaySurface::BindBackBufferRtv(std::wstring& error)
 {
     rtv_.Reset();
-    if (!device_ || !gpuTexture_)
+    if (!device_ || !swapChain_)
     {
-        error = L"BindRenderTarget skipped: GPU texture missing.";
+        error = L"BindBackBufferRtv skipped: swap chain missing.";
         return false;
     }
 
-    HRESULT const hr = device_->Device()->CreateRenderTargetView(gpuTexture_.Get(), nullptr, &rtv_);
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> backBuffer;
+    HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (FAILED(hr) || !backBuffer)
+    {
+        error = L"GetBuffer overlay back buffer failed " + FormatHresult(hr) + L".";
+        return false;
+    }
+
+    hr = device_->Device()->CreateRenderTargetView(backBuffer.Get(), nullptr, &rtv_);
     if (FAILED(hr) || !rtv_)
     {
-        error = L"CreateRenderTargetView failed " + FormatHresult(hr) + L".";
+        error = L"CreateRenderTargetView overlay swap chain failed " + FormatHresult(hr) + L".";
         return false;
     }
     return true;
@@ -773,7 +861,7 @@ bool OverlaySurface::BindRenderTarget(std::wstring& error)
 
 bool OverlaySurface::DrawMarker(std::wstring& error)
 {
-    if (!device_ || !rtv_ || !gpuTexture_)
+    if (!device_ || !rtv_ || !swapChain_)
     {
         error = L"Overlay draw skipped: resources missing.";
         return false;
@@ -789,9 +877,6 @@ bool OverlaySurface::DrawMarker(std::wstring& error)
 
     ID3D11RenderTargetView* views[] = {rtv_.Get()};
     context1->OMSetRenderTargets(1, views, nullptr);
-    // Tracing keeps a fully transparent clear so empty pixels are not hit-tested.
-    // Alignment uses a barely-visible premultiplied alpha fill so the whole HWND
-    // receives clicks (UpdateLayeredWindow ignores alpha=0 for hit-testing).
     if (mode_ == OverlayInteractionMode::Alignment)
     {
         float const alignClear[4] = {0.0f, 0.0f, 0.0f, 32.0f / 255.0f};
@@ -809,11 +894,16 @@ bool OverlaySurface::DrawMarker(std::wstring& error)
         context1->ClearRenderTargetView(rtv_.Get(), clear);
     }
 
+    unsigned const magentaWidth = (std::max)(180u, surfaceWidth_ / 5u);
+    unsigned const magentaHeight = (std::max)(80u, surfaceHeight_ / 10u);
+    unsigned const yellowWidth = (std::max)(48u, magentaWidth / 3u);
+    unsigned const yellowHeight = (std::max)(160u, surfaceHeight_ / 4u);
+
     D3D11_RECT magentaRect{
-        static_cast<LONG>(kMagentaX),
-        static_cast<LONG>(kMagentaY),
-        static_cast<LONG>(kMagentaX + kMagentaWidth),
-        static_cast<LONG>(kMagentaY + kMagentaHeight)};
+        static_cast<LONG>(kMarkerOriginX),
+        static_cast<LONG>(kMarkerOriginY),
+        static_cast<LONG>(kMarkerOriginX + magentaWidth),
+        static_cast<LONG>(kMarkerOriginY + magentaHeight)};
     if (ClipRect(magentaRect, surfaceWidth_, surfaceHeight_))
     {
         float const magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
@@ -821,10 +911,10 @@ bool OverlaySurface::DrawMarker(std::wstring& error)
     }
 
     D3D11_RECT yellowRect{
-        static_cast<LONG>(kYellowX),
-        static_cast<LONG>(kYellowY),
-        static_cast<LONG>(kYellowX + kYellowWidth),
-        static_cast<LONG>(kYellowY + kYellowHeight)};
+        static_cast<LONG>(kMarkerOriginX),
+        static_cast<LONG>(kMarkerOriginY + magentaHeight),
+        static_cast<LONG>(kMarkerOriginX + yellowWidth),
+        static_cast<LONG>(kMarkerOriginY + magentaHeight + yellowHeight)};
     if (ClipRect(yellowRect, surfaceWidth_, surfaceHeight_))
     {
         float const yellow[4] = {1.0f, 1.0f, 0.0f, 1.0f};
@@ -832,73 +922,28 @@ bool OverlaySurface::DrawMarker(std::wstring& error)
     }
 
     context1->OMSetRenderTargets(0, nullptr, nullptr);
-    return PresentLayered(error);
+    return Present(error);
 }
 
-bool OverlaySurface::PresentLayered(std::wstring& error)
+bool OverlaySurface::Present(std::wstring& error)
 {
-    if (!device_ || !gpuTexture_ || !stagingTexture_ || dibDc_ == nullptr || dibBits_ == nullptr ||
-        hwnd_ == nullptr)
+    if (!swapChain_)
     {
-        error = L"Layered present skipped: resources missing.";
+        error = L"DXGI HWND present skipped: swap chain missing.";
+        lastPresentResult_ = E_FAIL;
         return false;
     }
 
-    ID3D11DeviceContext* const context = device_->ImmediateContext();
-    std::uint64_t const readbackStart = QueryCounter();
-    context->CopyResource(stagingTexture_.Get(), gpuTexture_.Get());
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = context->Map(stagingTexture_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr))
+    UnbindContextTargets();
+    std::uint64_t const presentStart = QueryCounter();
+    lastPresentResult_ = swapChain_->Present(1, 0);
+    lastPresentUs_ = CounterToMicroseconds(presentStart, QueryCounter());
+    if (FAILED(lastPresentResult_))
     {
-        lastPresentResult_ = hr;
-        error = L"Map overlay staging failed " + FormatHresult(hr) + L".";
+        error = L"IDXGISwapChain1::Present overlay failed " + FormatHresult(lastPresentResult_) +
+                L".";
         return false;
     }
-
-    unsigned const rowBytes = surfaceWidth_ * 4u;
-    auto* dest = static_cast<std::uint8_t*>(dibBits_);
-    auto const* src = static_cast<std::uint8_t const*>(mapped.pData);
-    for (unsigned y = 0; y < surfaceHeight_; ++y)
-    {
-        std::memcpy(dest + (static_cast<size_t>(y) * rowBytes), src + (static_cast<size_t>(y) * mapped.RowPitch), rowBytes);
-    }
-    context->Unmap(stagingTexture_.Get(), 0);
-    lastReadbackUs_ = CounterToMicroseconds(readbackStart, QueryCounter());
-
-    POINT destination{lastPlacement_.x, lastPlacement_.y};
-    POINT source{0, 0};
-    SIZE size{
-        static_cast<LONG>(surfaceWidth_),
-        static_cast<LONG>(surfaceHeight_)};
-    BLENDFUNCTION blend{};
-    blend.BlendOp = AC_SRC_OVER;
-    blend.SourceConstantAlpha = 255;
-    blend.AlphaFormat = AC_SRC_ALPHA;
-
-    std::uint64_t const ulwStart = QueryCounter();
-    SetLastError(0);
-    BOOL const updated = UpdateLayeredWindow(
-        hwnd_,
-        nullptr,
-        &destination,
-        &size,
-        dibDc_,
-        &source,
-        0,
-        &blend,
-        ULW_ALPHA);
-    lastUlwUs_ = CounterToMicroseconds(ulwStart, QueryCounter());
-    if (updated == FALSE)
-    {
-        unsigned long const code = GetLastError();
-        lastPresentResult_ = HRESULT_FROM_WIN32(code);
-        error = L"UpdateLayeredWindow failed (Win32 " + std::to_wstring(code) + L").";
-        return false;
-    }
-
-    lastPresentResult_ = S_OK;
     return true;
 }
 

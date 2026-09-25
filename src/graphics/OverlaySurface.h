@@ -6,6 +6,8 @@
 
 #include "graphics/DeviceResources.h"
 
+#include <dxgi1_2.h>
+
 #include <cstdint>
 #include <string>
 
@@ -198,7 +200,28 @@ inline std::wstring FormatObsVerification(OverlayObsVerification)
     return L"NOT RUN";
 }
 
-// Top-level WS_EX_LAYERED overlay. DeviceResources is borrowed. Isolated from DirectComposition.
+enum class OverlayPresentAlphaMode
+{
+    Unspecified,
+    Premultiplied,
+    Ignore,
+};
+
+inline std::wstring FormatOverlayPresentAlphaMode(OverlayPresentAlphaMode mode)
+{
+    switch (mode)
+    {
+    case OverlayPresentAlphaMode::Premultiplied:
+        return L"premultiplied";
+    case OverlayPresentAlphaMode::Ignore:
+        return L"ignore";
+    default:
+        return L"unspecified";
+    }
+}
+
+// Top-level WS_EX_LAYERED overlay presented with CreateSwapChainForHwnd.
+// DeviceResources is borrowed. Isolated from DirectComposition and ULW.
 class OverlaySurface
 {
 public:
@@ -241,25 +264,30 @@ public:
     unsigned ConsumedMouseDown() const noexcept;
     unsigned ConsumedWheel() const noexcept;
     unsigned ConsumedPointerDown() const noexcept;
+    bool EnsurePresentSize(unsigned width, unsigned height, std::wstring& error);
+    ID3D11RenderTargetView* RenderTargetView() const noexcept;
+    unsigned PresentWidth() const noexcept;
+    unsigned PresentHeight() const noexcept;
+    bool Present(std::wstring& error);
     std::wstring FormatReport() const;
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);
     bool RegisterOverlayClass(HINSTANCE instance, std::wstring& error);
     bool CreateOverlayWindow(HINSTANCE instance, std::wstring& error);
-    bool CreateGpuSurfaces(unsigned width, unsigned height, std::wstring& error);
+    bool CreateDxgiFactory(std::wstring& error);
+    bool ApplyLayeredRedirection(std::wstring& error);
+    bool ApplyDwmExtendedFrame(std::wstring& error);
     bool ApplyExcludeFromCapture();
     bool ApplyNonePositiveControl();
     bool ApplyActiveAffinity();
     bool ApplyDisplayAffinity(unsigned long affinity);
     bool ApplyHitTestStyles();
-    bool EnsureSurfaceSize(unsigned width, unsigned height, std::wstring& error);
-    bool BindRenderTarget(std::wstring& error);
-    bool EnsureDib(unsigned width, unsigned height, std::wstring& error);
-    void ReleaseDib() noexcept;
-    void ReleaseGpuSurfaces() noexcept;
+    bool EnsureSwapChain(unsigned width, unsigned height, std::wstring& error);
+    bool BindBackBufferRtv(std::wstring& error);
+    void UnbindContextTargets() noexcept;
+    void ReleaseSwapChain() noexcept;
     bool DrawMarker(std::wstring& error);
-    bool PresentLayered(std::wstring& error);
     void HideWindowOnly();
     OverlayPlacement TestPatternPlacement() const;
     LONG_PTR CurrentExStyle() const noexcept;
@@ -267,27 +295,26 @@ private:
     DeviceResources* device_ = nullptr;
     HWND controlWindow_ = nullptr;
     HWND hwnd_ = nullptr;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> gpuTexture_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> stagingTexture_;
+    Microsoft::WRL::ComPtr<IDXGIFactory2> factory_;
+    Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain_;
     Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv_;
-    HDC dibDc_ = nullptr;
-    HBITMAP dibBitmap_ = nullptr;
-    HGDIOBJ dibOld_ = nullptr;
-    void* dibBits_ = nullptr;
     OverlayAffinityStatus affinity_{};
     OverlayAffinityMode affinityMode_ = OverlayAffinityMode::ExcludeFromCapture;
     OverlayVisibilityResult lastVisibility_{};
     OverlayPlacement lastPlacement_{};
+    OverlayPresentAlphaMode alphaMode_ = OverlayPresentAlphaMode::Unspecified;
     unsigned surfaceWidth_ = 0;
     unsigned surfaceHeight_ = 0;
     HRESULT lastPresentResult_ = S_OK;
-    unsigned long lastReadbackUs_ = 0;
-    unsigned long lastUlwUs_ = 0;
+    HRESULT premulCreateHr_ = S_OK;
+    HRESULT ignoreCreateHr_ = S_OK;
+    unsigned long lastPresentUs_ = 0;
     bool contentReady_ = false;
     bool emergencyHidden_ = false;
     bool testPatternActive_ = false;
     bool visible_ = false;
     bool topmostWhileShown_ = false;
+    bool dwmExtendedFrame_ = false;
     OverlayInteractionMode mode_ = OverlayInteractionMode::Tracing;
     unsigned consumedMouseDown_ = 0;
     unsigned consumedWheel_ = 0;
@@ -363,6 +390,21 @@ inline unsigned OverlaySurface::ConsumedWheel() const noexcept
 inline unsigned OverlaySurface::ConsumedPointerDown() const noexcept
 {
     return consumedPointerDown_;
+}
+
+inline ID3D11RenderTargetView* OverlaySurface::RenderTargetView() const noexcept
+{
+    return rtv_.Get();
+}
+
+inline unsigned OverlaySurface::PresentWidth() const noexcept
+{
+    return surfaceWidth_;
+}
+
+inline unsigned OverlaySurface::PresentHeight() const noexcept
+{
+    return surfaceHeight_;
 }
 
 inline void OverlaySurface::ClearEmergencyHide() noexcept
