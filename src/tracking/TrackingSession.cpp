@@ -1,4 +1,5 @@
 #include "tracking/TrackingSession.h"
+#include "tracking/TransformFusion.h"
 
 #include <cstdio>
 #include <utility>
@@ -26,6 +27,43 @@ CanvasView ViewFromFrame(TrackingRoiFrame const& frame) noexcept
     view.stride = frame.meta.stride;
     view.format = PixelFormat::Bgra32;
     return view;
+}
+
+VisualEstimate FuseVisualOnlyIdentity(
+    VisualEstimate pose,
+    TrackingFrameMeta const& meta)
+{
+    if (pose.reject != VisualReject::Ok)
+    {
+        return pose;
+    }
+
+    TransformFusion fusion;
+    FusionContext context{};
+    context.targetGeneration = meta.targetGeneration;
+    context.geometryGeneration = meta.geometryGeneration;
+    context.calibrationGeneration = meta.calibrationGeneration;
+    context.nowMs = 0;
+
+    FusionSample visual = FromVisual(pose);
+    visual.targetGeneration = meta.targetGeneration;
+    visual.geometryGeneration = meta.geometryGeneration;
+    visual.calibrationGeneration = meta.calibrationGeneration;
+    visual.timestampMs = 0;
+
+    FusionInputs inputs{};
+    inputs.hasVisual = true;
+    inputs.visual = visual;
+    FusionResult const fused = fusion.Fuse(context, inputs);
+    if (!fused.accepted)
+    {
+        return pose;
+    }
+    pose.tx = fused.tx;
+    pose.ty = fused.ty;
+    pose.uniformScale = fused.uniformScale;
+    pose.radiansClockwise = fused.radiansClockwise;
+    return pose;
 }
 
 } // namespace
@@ -342,7 +380,10 @@ TrackingApplyResult TrackingSession::SubmitEstimateForTest(
         secondaryEstimate);
     if (applied.accepted)
     {
-        PublishLocked(meta.captureTicks, meta.sequence, applied.poseEstimate);
+        PublishLocked(
+            meta.captureTicks,
+            meta.sequence,
+            FuseVisualOnlyIdentity(applied.poseEstimate, meta));
     }
     snapshot_ = BuildSnapshotLocked(now);
     snapshot_.lastReject = policy_.LastReject();
@@ -527,7 +568,10 @@ void TrackingSession::ProcessCurrentFrame(TrackingRoiFrame const& current)
             secondaryEstimate);
         if (applied.accepted)
         {
-            PublishLocked(current.meta.captureTicks, current.meta.sequence, applied.poseEstimate);
+            PublishLocked(
+                current.meta.captureTicks,
+                current.meta.sequence,
+                FuseVisualOnlyIdentity(applied.poseEstimate, current.meta));
             if (policy_.State() == TrackingState::Tracking &&
                 SecondaryPromotionQualityOk(applied.poseEstimate) &&
                 !OverlayRelativeNearIdentity(policy_.LastRelative()))
