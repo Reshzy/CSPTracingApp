@@ -116,6 +116,8 @@ std::string FormatTrackingSnapshot(TransformSnapshot const& snapshot)
     text += number;
     text += " reacquire=";
     text += std::to_string(snapshot.reacquireCount);
+    text += " secondary=";
+    text += snapshot.hasSecondaryAnchor ? "yes" : "no";
     text += " parity=";
     text += VisualParityName(VisualParityFromFlags(snapshot.flipX, snapshot.flipY));
     text += " gens=";
@@ -170,7 +172,9 @@ bool TrackingSession::BeginCalibrated(
         viewportAnchorS_ = viewportAnchorS;
         keyframe_ = {};
         previous_ = {};
+        secondary_ = {};
         hasPreviousFrame_ = false;
+        hasSecondaryFrame_ = false;
         pending_[0] = {};
         pending_[1] = {};
         pendingCount_ = 0;
@@ -196,6 +200,7 @@ void TrackingSession::Resume()
 {
     std::lock_guard<std::mutex> const lock(mutex_);
     policy_.Resume();
+    pausedForParity_ = false;
     snapshot_.state = policy_.State();
     snapshot_.hideOverlay = TrackingHidesOverlay(snapshot_.state);
 }
@@ -206,7 +211,9 @@ void TrackingSession::Resync()
     policy_.Resync();
     keyframe_ = {};
     previous_ = {};
+    secondary_ = {};
     hasPreviousFrame_ = false;
+    hasSecondaryFrame_ = false;
     pending_[0] = {};
     pending_[1] = {};
     pendingCount_ = 0;
@@ -221,7 +228,9 @@ void TrackingSession::Detach()
     policy_.Detach();
     keyframe_ = {};
     previous_ = {};
+    secondary_ = {};
     hasPreviousFrame_ = false;
+    hasSecondaryFrame_ = false;
     pending_[0] = {};
     pending_[1] = {};
     pendingCount_ = 0;
@@ -317,7 +326,9 @@ TrackingApplyResult TrackingSession::SubmitEstimateForTest(
     VisualEstimate const& keyframeEstimate,
     bool hasPrevious,
     VisualEstimate const& previousEstimate,
-    std::chrono::steady_clock::time_point now)
+    std::chrono::steady_clock::time_point now,
+    bool hasSecondaryEstimate,
+    VisualEstimate const& secondaryEstimate)
 {
     std::lock_guard<std::mutex> const lock(mutex_);
     TrackingApplyResult const applied = policy_.ApplyObservation(
@@ -326,21 +337,30 @@ TrackingApplyResult TrackingSession::SubmitEstimateForTest(
         hasPrevious,
         previousEstimate,
         options_,
-        now);
+        now,
+        hasSecondaryEstimate,
+        secondaryEstimate);
     if (applied.accepted)
     {
-        PublishLocked(meta.captureTicks, meta.sequence, keyframeEstimate);
+        PublishLocked(meta.captureTicks, meta.sequence, applied.poseEstimate);
     }
     snapshot_ = BuildSnapshotLocked(now);
     snapshot_.lastReject = policy_.LastReject();
     if (applied.accepted)
     {
-        snapshot_.confidence = keyframeEstimate.confidence;
-        snapshot_.inlierCount = keyframeEstimate.inlierCount;
-        snapshot_.rmsResidualPx = keyframeEstimate.rmsResidualPx;
+        snapshot_.confidence = applied.poseEstimate.confidence;
+        snapshot_.inlierCount = applied.poseEstimate.inlierCount;
+        snapshot_.rmsResidualPx = applied.poseEstimate.rmsResidualPx;
         snapshot_.sequence = meta.sequence;
         snapshot_.captureTicks = meta.captureTicks;
-        snapshot_.lastReject = keyframeEstimate.reject;
+        snapshot_.lastReject = applied.poseEstimate.reject;
+        snapshot_.flipX = applied.poseEstimate.flipX;
+        snapshot_.flipY = applied.poseEstimate.flipY;
+    }
+    if (policy_.State() == TrackingState::Paused &&
+        keyframeEstimate.reject == VisualReject::ParityAmbiguous)
+    {
+        pausedForParity_ = true;
     }
     return applied;
 }
@@ -360,12 +380,25 @@ void TrackingSession::CaptureKeyframeForTest(
     policy_.NoteKeyframeCaptured(now, meta.sequence);
     keyframe_.meta = meta;
     previous_.meta = meta;
+    secondary_ = {};
     hasPreviousFrame_ = false;
+    hasSecondaryFrame_ = false;
+    pausedForParity_ = false;
     lastEstimate_.reject = VisualReject::Ok;
     lastEstimate_.uniformScale = 1.0;
     lastEstimate_.confidence = 1.0;
+    lastEstimate_.flipX = false;
+    lastEstimate_.flipY = false;
+    lastEstimate_.parity = VisualParity::None;
     PublishLocked(meta.captureTicks, meta.sequence, lastEstimate_);
     snapshot_ = BuildSnapshotLocked(now);
+}
+
+void TrackingSession::PromoteSecondaryAnchorForTest()
+{
+    std::lock_guard<std::mutex> const lock(mutex_);
+    policy_.PromoteSecondaryAnchor();
+    snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
 }
 
 void TrackingSession::Tick(std::chrono::steady_clock::time_point now)
@@ -426,7 +459,9 @@ void TrackingSession::ProcessCurrentFrame(TrackingRoiFrame const& current)
 {
     TrackingRoiFrame keyframeCopy{};
     TrackingRoiFrame previousCopy{};
+    TrackingRoiFrame secondaryCopy{};
     bool hasPrevious = false;
+    bool hasSecondary = false;
     VisualTrackerOptions trackerOptions{};
     {
         std::lock_guard<std::mutex> const lock(mutex_);
@@ -434,7 +469,9 @@ void TrackingSession::ProcessCurrentFrame(TrackingRoiFrame const& current)
         {
             keyframe_ = current;
             previous_ = {};
+            secondary_ = {};
             hasPreviousFrame_ = false;
+            hasSecondaryFrame_ = false;
             pausedForParity_ = false;
             policy_.NoteKeyframeCaptured(std::chrono::steady_clock::now(), current.meta.sequence);
             lastEstimate_.reject = VisualReject::Ok;
@@ -452,6 +489,11 @@ void TrackingSession::ProcessCurrentFrame(TrackingRoiFrame const& current)
         {
             previousCopy = previous_;
         }
+        hasSecondary = hasSecondaryFrame_ && policy_.HasSecondaryAnchor();
+        if (hasSecondary)
+        {
+            secondaryCopy = secondary_;
+        }
         trackerOptions.preferredParity =
             VisualParityFromFlags(lastEstimate_.flipX, lastEstimate_.flipY);
     }
@@ -464,42 +506,46 @@ void TrackingSession::ProcessCurrentFrame(TrackingRoiFrame const& current)
         previousEstimate =
             EstimateCanvasMotion(ViewFromFrame(previousCopy), ViewFromFrame(current), trackerOptions);
     }
+    VisualEstimate secondaryEstimate{};
+    if (hasSecondary)
+    {
+        secondaryEstimate = EstimateCanvasMotion(
+            ViewFromFrame(secondaryCopy), ViewFromFrame(current), trackerOptions);
+    }
 
     auto const now = std::chrono::steady_clock::now();
     {
         std::lock_guard<std::mutex> const lock(mutex_);
-        if (keyframeEstimate.reject == VisualReject::ParityAmbiguous)
-        {
-            policy_.Pause();
-            pausedForParity_ = true;
-            lastEstimate_ = keyframeEstimate;
-            snapshot_ = BuildSnapshotLocked(now);
-            snapshot_.lastReject = keyframeEstimate.reject;
-            previous_ = current;
-            hasPreviousFrame_ = true;
-            return;
-        }
-        if (pausedForParity_ && keyframeEstimate.reject == VisualReject::Ok)
-        {
-            policy_.Resume();
-            pausedForParity_ = false;
-        }
-
         TrackingApplyResult const applied = policy_.ApplyObservation(
             current.meta,
             keyframeEstimate,
             hasPrevious,
             previousEstimate,
             options_,
-            now);
+            now,
+            hasSecondary,
+            secondaryEstimate);
         if (applied.accepted)
         {
-            PublishLocked(current.meta.captureTicks, current.meta.sequence, keyframeEstimate);
+            PublishLocked(current.meta.captureTicks, current.meta.sequence, applied.poseEstimate);
+            if (policy_.State() == TrackingState::Tracking &&
+                SecondaryPromotionQualityOk(applied.poseEstimate) &&
+                !OverlayRelativeNearIdentity(policy_.LastRelative()))
+            {
+                secondary_ = current;
+                hasSecondaryFrame_ = true;
+                policy_.PromoteSecondaryAnchor();
+            }
         }
         else
         {
             snapshot_ = BuildSnapshotLocked(now);
             snapshot_.lastReject = policy_.LastReject();
+        }
+        if (policy_.State() == TrackingState::Paused &&
+            keyframeEstimate.reject == VisualReject::ParityAmbiguous)
+        {
+            pausedForParity_ = true;
         }
         previous_ = current;
         hasPreviousFrame_ = true;
@@ -525,8 +571,9 @@ TransformSnapshot TrackingSession::BuildSnapshotLocked(
     snapshot.rmsResidualPx = snapshot_.rmsResidualPx;
     snapshot.flipX = lastEstimate_.flipX;
     snapshot.flipY = lastEstimate_.flipY;
-    snapshot.driftRmsPx = snapshot_.rmsResidualPx;
-    snapshot.reacquireCount = policy_.ReacquireCount();
+    snapshot.driftRmsPx = policy_.OriginDriftRmsPx();
+    snapshot.reacquireCount = policy_.ReacquireEvents();
+    snapshot.hasSecondaryAnchor = policy_.HasSecondaryAnchor();
 
     core::Transform2D const relative = policy_.LastRelative();
     std::optional<core::Transform2D> const mDo = core::Compose(mDoKeyframe_, relative);

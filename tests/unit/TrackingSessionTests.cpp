@@ -37,6 +37,8 @@ using tracing::tracking::TrackingSessionPolicy;
 using tracing::tracking::TrackingState;
 using tracing::tracking::TransformSnapshot;
 using tracing::tracking::VisualEstimate;
+using tracing::tracking::VisualParity;
+using tracing::tracking::VisualParityFromFlags;
 using tracing::tracking::VisualReject;
 
 using Clock = std::chrono::steady_clock;
@@ -60,7 +62,13 @@ TrackingFrameMeta Meta(
     return meta;
 }
 
-VisualEstimate OkEstimate(double tx = 0.0, double ty = 0.0, double scale = 1.0, double radians = 0.0)
+VisualEstimate OkEstimate(
+    double tx = 0.0,
+    double ty = 0.0,
+    double scale = 1.0,
+    double radians = 0.0,
+    bool flipX = false,
+    bool flipY = false)
 {
     VisualEstimate estimate{};
     estimate.reject = VisualReject::Ok;
@@ -68,6 +76,9 @@ VisualEstimate OkEstimate(double tx = 0.0, double ty = 0.0, double scale = 1.0, 
     estimate.ty = ty;
     estimate.uniformScale = scale;
     estimate.radiansClockwise = radians;
+    estimate.flipX = flipX;
+    estimate.flipY = flipY;
+    estimate.parity = VisualParityFromFlags(flipX, flipY);
     estimate.confidence = 0.5;
     estimate.inlierCount = 20;
     estimate.matchCount = 24;
@@ -466,6 +477,239 @@ TEST(TrackingSession, WorkerBlankAfterKeyframeDoesNotJump)
     ASSERT_TRUE(originAfter.has_value());
     EXPECT_NEAR(originBefore->x, originAfter->x, 1.0e-9);
     EXPECT_NEAR(originBefore->y, originAfter->y, 1.0e-9);
+}
+
+TEST(TrackingSession, ParityAmbiguousPausesAndDoesNotMoveTransform)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    ASSERT_EQ(
+        session.SubmitEstimateForTest(Meta(2), OkEstimate(), false, {}, t0).action,
+        TrackingApplyAction::Accepted);
+    TransformSnapshot const before = session.Snapshot();
+    EXPECT_EQ(before.state, TrackingState::Tracking);
+    std::optional<Vec2> const originBefore = Apply(before.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originBefore.has_value());
+
+    VisualEstimate ambiguous{};
+    ambiguous.reject = VisualReject::ParityAmbiguous;
+    ambiguous.confidence = 0.0;
+    ambiguous.tx = 80.0;
+    auto const paused = session.SubmitEstimateForTest(Meta(3), ambiguous, false, {}, t0);
+    EXPECT_EQ(paused.action, TrackingApplyAction::RejectedQuality);
+    EXPECT_EQ(paused.state, TrackingState::Paused);
+
+    TransformSnapshot const after = session.Snapshot();
+    EXPECT_EQ(after.state, TrackingState::Paused);
+    EXPECT_EQ(after.lastReject, VisualReject::ParityAmbiguous);
+    EXPECT_FALSE(after.hideOverlay);
+    EXPECT_EQ(after.sequence, 2u);
+    std::optional<Vec2> const originAfter = Apply(after.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originAfter.has_value());
+    EXPECT_NEAR(originBefore->x, originAfter->x, 1.0e-9);
+    EXPECT_NEAR(originBefore->y, originAfter->y, 1.0e-9);
+
+    EXPECT_EQ(
+        session.SubmitEstimateForTest(Meta(4), OkEstimate(40.0, 0.0), false, {}, t0).action,
+        TrackingApplyAction::Ignored);
+    TransformSnapshot const frozen = session.Snapshot();
+    EXPECT_EQ(frozen.state, TrackingState::Paused);
+    EXPECT_EQ(frozen.sequence, 2u);
+}
+
+TEST(TrackingSession, ParityHysteresisRejectsSingleFlipThenAccepts)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    ASSERT_EQ(
+        session.SubmitEstimateForTest(Meta(2), OkEstimate(), false, {}, t0).action,
+        TrackingApplyAction::Accepted);
+    TransformSnapshot const before = session.Snapshot();
+    EXPECT_EQ(before.state, TrackingState::Tracking);
+    EXPECT_FALSE(before.flipX);
+    std::optional<Vec2> const originBefore = Apply(before.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originBefore.has_value());
+
+    VisualEstimate const flipX = OkEstimate(0.0, 0.0, 1.0, 0.0, true, false);
+    auto const first = session.SubmitEstimateForTest(Meta(3), flipX, false, {}, t0);
+    EXPECT_EQ(first.action, TrackingApplyAction::RejectedQuality);
+    TransformSnapshot const held = session.Snapshot();
+    EXPECT_EQ(held.state, TrackingState::Degraded);
+    EXPECT_FALSE(held.flipX);
+    EXPECT_EQ(held.sequence, 2u);
+    std::optional<Vec2> const originHeld = Apply(held.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originHeld.has_value());
+    EXPECT_NEAR(originBefore->x, originHeld->x, 1.0e-9);
+    EXPECT_NEAR(originBefore->y, originHeld->y, 1.0e-9);
+
+    auto const second = session.SubmitEstimateForTest(Meta(4), flipX, false, {}, t0);
+    EXPECT_EQ(second.action, TrackingApplyAction::Accepted);
+    TransformSnapshot const after = session.Snapshot();
+    EXPECT_EQ(after.state, TrackingState::Tracking);
+    EXPECT_TRUE(after.flipX);
+    EXPECT_FALSE(after.flipY);
+    EXPECT_EQ(VisualParityFromFlags(after.flipX, after.flipY), VisualParity::FlipX);
+    EXPECT_EQ(after.sequence, 4u);
+    EXPECT_EQ(after.lastReject, VisualReject::Ok);
+}
+
+TEST(TrackingSession, WorkerReturnToKeyframeRestoresIdentity)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+
+    cv::Mat const prior = MakeTexturedGray(0x51EDu);
+    cv::Mat affine = cv::Mat::eye(2, 3, CV_64F);
+    affine.at<double>(0, 2) = 8.0;
+    affine.at<double>(1, 2) = 5.0;
+    cv::Mat currentGray;
+    cv::warpAffine(
+        prior,
+        currentGray,
+        affine,
+        prior.size(),
+        cv::INTER_LINEAR,
+        cv::BORDER_CONSTANT,
+        cv::Scalar(128));
+
+    ASSERT_EQ(session.SubmitRoiFrame(FrameFromBgra(GrayToBgra(prior), 1)), TrackingFrameAction::Enqueue);
+    ASSERT_TRUE(WaitUntil(session, [](TransformSnapshot const& snap) {
+        return snap.hasKeyframe && snap.sequence == 1u;
+    }, 4000)) << session.FormatReport();
+
+    TransformSnapshot const key = session.Snapshot();
+    std::optional<Vec2> const originKey = Apply(key.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originKey.has_value());
+
+    ASSERT_EQ(
+        session.SubmitRoiFrame(FrameFromBgra(GrayToBgra(currentGray), 2)), TrackingFrameAction::Enqueue);
+    ASSERT_TRUE(WaitUntil(session, [](TransformSnapshot const& snap) {
+        return snap.state == TrackingState::Tracking && snap.sequence == 2u &&
+               snap.lastReject == VisualReject::Ok;
+    }, 4000)) << session.FormatReport();
+
+    ASSERT_EQ(session.SubmitRoiFrame(FrameFromBgra(GrayToBgra(prior), 3)), TrackingFrameAction::Enqueue);
+    ASSERT_TRUE(WaitUntil(session, [](TransformSnapshot const& snap) {
+        return snap.state == TrackingState::Tracking && snap.sequence == 3u &&
+               snap.lastReject == VisualReject::Ok;
+    }, 4000)) << session.FormatReport();
+
+    TransformSnapshot const back = session.Snapshot();
+    EXPECT_TRUE(back.hasKeyframe);
+    std::optional<Vec2> const originBack = Apply(back.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originBack.has_value());
+    EXPECT_NEAR(originBack->x, originKey->x, 2.5);
+    EXPECT_NEAR(originBack->y, originKey->y, 2.5);
+}
+
+TEST(TrackingSession, SecondaryAnchorNotPromotedOnBlank)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+
+    cv::Mat const prior = MakeTexturedGray(0x22AAu);
+    ASSERT_EQ(session.SubmitRoiFrame(FrameFromBgra(GrayToBgra(prior), 1)), TrackingFrameAction::Enqueue);
+    ASSERT_TRUE(WaitUntil(session, [](TransformSnapshot const& snap) {
+        return snap.hasKeyframe && snap.sequence == 1u;
+    })) << session.FormatReport();
+    EXPECT_FALSE(session.Snapshot().hasSecondaryAnchor);
+
+    cv::Mat blank(kWorkerHeight, kWorkerWidth, CV_8UC1, cv::Scalar(128));
+    ASSERT_EQ(
+        session.SubmitRoiFrame(FrameFromBgra(GrayToBgra(blank), 2)), TrackingFrameAction::Enqueue);
+    ASSERT_TRUE(WaitUntil(session, [](TransformSnapshot const& snap) {
+        return snap.state == TrackingState::Degraded &&
+               snap.lastReject == VisualReject::BlankOrLowTexture;
+    })) << session.FormatReport();
+    EXPECT_FALSE(session.Snapshot().hasSecondaryAnchor);
+}
+
+TEST(TrackingSession, RelocalizeUsesSecondaryWhenOriginResidualWorse)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    ASSERT_EQ(
+        session.SubmitEstimateForTest(Meta(2), OkEstimate(8.0, 5.0), false, {}, t0).action,
+        TrackingApplyAction::Accepted);
+    session.PromoteSecondaryAnchorForTest();
+    TransformSnapshot const anchored = session.Snapshot();
+    EXPECT_TRUE(anchored.hasSecondaryAnchor);
+    EXPECT_EQ(anchored.state, TrackingState::Tracking);
+    std::optional<Vec2> const originBefore = Apply(anchored.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originBefore.has_value());
+
+    VisualEstimate originBad{};
+    originBad.reject = VisualReject::HighResidual;
+    originBad.tx = 80.0;
+    originBad.ty = 0.0;
+    originBad.uniformScale = 1.0;
+    originBad.rmsResidualPx = 6.5;
+    originBad.confidence = 0.1;
+    originBad.inlierCount = 4;
+
+    VisualEstimate secondaryOk = OkEstimate(2.0, 0.0);
+    secondaryOk.rmsResidualPx = 0.35;
+    auto const rescued = session.SubmitEstimateForTest(
+        Meta(3), originBad, false, {}, t0, true, secondaryOk);
+    EXPECT_TRUE(rescued.accepted);
+    EXPECT_TRUE(rescued.usedSecondary);
+    EXPECT_EQ(rescued.action, TrackingApplyAction::Accepted);
+
+    TransformSnapshot const after = session.Snapshot();
+    EXPECT_EQ(after.state, TrackingState::Tracking);
+    EXPECT_TRUE(after.hasSecondaryAnchor);
+    EXPECT_NEAR(after.driftRmsPx, 6.5, 1.0e-9);
+    EXPECT_NEAR(after.rmsResidualPx, 0.35, 1.0e-9);
+    EXPECT_EQ(after.lastReject, VisualReject::Ok);
+    std::optional<Vec2> const originAfter = Apply(after.mDs, Vec2{0.0, 0.0});
+    ASSERT_TRUE(originAfter.has_value());
+    EXPECT_NEAR(originAfter->x - originBefore->x, 2.0, 1.0e-6);
+    EXPECT_NEAR(originAfter->y - originBefore->y, 0.0, 1.0e-6);
+}
+
+TEST(TrackingSession, ReacquireEventsSeparateFromDrift)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    EXPECT_EQ(session.Snapshot().reacquireCount, 0);
+    session.Tick(t0 + kLostAge);
+    EXPECT_EQ(session.Snapshot().state, TrackingState::Lost);
+
+    auto const t1 = t0 + kLostAge + std::chrono::milliseconds(10);
+    VisualEstimate const ok = OkEstimate();
+    EXPECT_EQ(session.SubmitEstimateForTest(Meta(2), ok, false, {}, t1).action, TrackingApplyAction::Accepted);
+    EXPECT_EQ(session.Snapshot().reacquireCount, 0);
+    EXPECT_EQ(
+        session.SubmitEstimateForTest(Meta(3), ok, false, {}, t1).action, TrackingApplyAction::Accepted);
+    EXPECT_EQ(
+        session.SubmitEstimateForTest(Meta(4), ok, false, {}, t1).action, TrackingApplyAction::Reacquired);
+
+    TransformSnapshot const reacquired = session.Snapshot();
+    EXPECT_EQ(reacquired.state, TrackingState::Tracking);
+    EXPECT_GE(reacquired.reacquireCount, 1);
+    EXPECT_NEAR(reacquired.driftRmsPx, ok.rmsResidualPx, 1.0e-9);
+    EXPECT_NEAR(reacquired.rmsResidualPx, ok.rmsResidualPx, 1.0e-9);
+
+    auto const blanked = session.SubmitEstimateForTest(Meta(5), BlankEstimate(), false, {}, t1);
+    EXPECT_EQ(blanked.action, TrackingApplyAction::RejectedQuality);
+    TransformSnapshot const afterBlank = session.Snapshot();
+    EXPECT_EQ(afterBlank.state, TrackingState::Degraded);
+    EXPECT_EQ(afterBlank.reacquireCount, reacquired.reacquireCount);
+    EXPECT_EQ(afterBlank.lastReject, VisualReject::BlankOrLowTexture);
 }
 
 TEST(TrackingSimilarity, IdentityRoundTripMatchesCalibrationMds)

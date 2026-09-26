@@ -20,6 +20,9 @@ namespace tracing::tracking {
 inline constexpr std::chrono::milliseconds kDegradedAge{150};
 inline constexpr std::chrono::milliseconds kLostAge{300};
 inline constexpr int kReacquireConsistentCount = 3;
+inline constexpr int kParityHysteresisCount = 2;
+inline constexpr double kMinSecondaryConfidence = 0.45;
+inline constexpr int kMinSecondaryInliers = 16;
 inline constexpr std::size_t kMaxTrackingPending = 2;
 
 enum class TrackingState
@@ -100,6 +103,7 @@ struct TransformSnapshot
     bool flipY = false;
     double driftRmsPx = 0.0;
     int reacquireCount = 0;
+    bool hasSecondaryAnchor = false;
 };
 
 struct TrackingHandoffResult
@@ -112,6 +116,9 @@ struct TrackingApplyResult
     TrackingApplyAction action = TrackingApplyAction::Ignored;
     TrackingState state = TrackingState::Unattached;
     bool accepted = false;
+    bool usedSecondary = false;
+    double originDriftRmsPx = 0.0;
+    VisualEstimate poseEstimate{};
 };
 
 char const* FormatTrackingState(TrackingState state) noexcept;
@@ -228,6 +235,47 @@ inline bool TransformSimilaritiesContradict(
     return std::fabs(WrapRadians(angleL - angleR)) > options.contradictionRadians;
 }
 
+inline VisualParity EstimateParity(VisualEstimate const& estimate) noexcept
+{
+    return VisualParityFromFlags(estimate.flipX, estimate.flipY);
+}
+
+inline bool OriginRejectAllowsSecondaryRescue(VisualReject reject) noexcept
+{
+    return reject == VisualReject::HighResidual || reject == VisualReject::PoorCoverage;
+}
+
+inline bool SecondaryPromotionQualityOk(VisualEstimate const& estimate) noexcept
+{
+    return estimate.reject == VisualReject::Ok &&
+           estimate.confidence >= kMinSecondaryConfidence &&
+           estimate.inlierCount >= kMinSecondaryInliers;
+}
+
+inline bool OverlayRelativeNearIdentity(core::Transform2D const& relative) noexcept
+{
+    if (relative.from != core::Space::O || relative.to != core::Space::O)
+    {
+        return false;
+    }
+    std::optional<core::Vec2> const origin = core::Apply(relative, core::Vec2{});
+    if (!origin.has_value())
+    {
+        return true;
+    }
+    if (std::hypot(origin->x, origin->y) >= 1.0)
+    {
+        return false;
+    }
+    double const scale = std::hypot(relative.matrix.m[0], relative.matrix.m[1]);
+    if (std::fabs(scale - 1.0) >= 0.02)
+    {
+        return false;
+    }
+    double const angle = std::atan2(relative.matrix.m[1], relative.matrix.m[0]);
+    return std::fabs(WrapRadians(angle)) < 0.02;
+}
+
 inline bool EstimatesContradict(
     VisualEstimate const& keyframeEstimate,
     bool hasPrevious,
@@ -265,7 +313,8 @@ inline TrackingState ApplyAgeLimit(
     {
         return state;
     }
-    if (state == TrackingState::Unattached || state == TrackingState::Unavailable)
+    if (state == TrackingState::Unattached || state == TrackingState::Unavailable ||
+        state == TrackingState::Paused)
     {
         return state;
     }
@@ -307,8 +356,12 @@ public:
     std::uint64_t LastAcceptedSequence() const noexcept;
     std::size_t Pending() const noexcept;
     int ReacquireCount() const noexcept;
+    int ReacquireEvents() const noexcept;
     VisualReject LastReject() const noexcept;
     core::Transform2D LastRelative() const;
+    bool HasSecondaryAnchor() const noexcept;
+    core::Transform2D SecondaryRelative() const;
+    double OriginDriftRmsPx() const noexcept;
     std::uint64_t TargetGeneration() const noexcept;
     std::uint64_t GeometryGeneration() const noexcept;
     std::uint64_t CalibrationGeneration() const noexcept;
@@ -336,7 +389,10 @@ public:
         bool hasPrevious,
         VisualEstimate const& previousEstimate,
         TrackingSessionOptions const& options,
-        std::chrono::steady_clock::time_point now) noexcept;
+        std::chrono::steady_clock::time_point now,
+        bool hasSecondaryEstimate = false,
+        VisualEstimate const& secondaryEstimate = {}) noexcept;
+    bool PromoteSecondaryAnchor() noexcept;
     void Tick(
         std::chrono::steady_clock::time_point now,
         TrackingSessionOptions const& options) noexcept;
@@ -349,6 +405,18 @@ private:
     bool EstimatesAgreeForReacquire(
         VisualEstimate const& estimate,
         TrackingSessionOptions const& options) const noexcept;
+    void ResetParityStreak() noexcept;
+    bool ParityHysteresisAllows(
+        VisualParity incoming, VisualReject originReject) noexcept;
+    TrackingApplyResult FinishAccept(
+        TrackingFrameMeta const& meta,
+        VisualEstimate const& poseEstimate,
+        core::Transform2D const& chosenRelative,
+        double originDriftRmsPx,
+        bool usedSecondary,
+        VisualParity acceptedParity,
+        TrackingSessionOptions const& options,
+        std::chrono::steady_clock::time_point now) noexcept;
 
     TrackingState state_ = TrackingState::Unattached;
     bool generationValid_ = false;
@@ -360,10 +428,17 @@ private:
     std::uint64_t lastAcceptedSequence_ = 0;
     std::size_t pending_ = 0;
     int reacquireCount_ = 0;
+    int reacquireEvents_ = 0;
     VisualReject lastReject_ = VisualReject::DegenerateSize;
     core::Transform2D lastRelative_ = core::Identity(core::Space::O, core::Space::O);
     VisualEstimate lastReacquire_{};
     bool hasReacquireRef_ = false;
+    bool hasSecondaryAnchor_ = false;
+    core::Transform2D secondaryRelative_ = core::Identity(core::Space::O, core::Space::O);
+    VisualParity lastAcceptedParity_ = VisualParity::None;
+    VisualParity parityStreakParity_ = VisualParity::None;
+    int parityStreak_ = 0;
+    double lastOriginDriftRmsPx_ = 0.0;
     std::chrono::steady_clock::time_point lastTrustworthy_{};
 };
 
@@ -402,6 +477,11 @@ inline int TrackingSessionPolicy::ReacquireCount() const noexcept
     return reacquireCount_;
 }
 
+inline int TrackingSessionPolicy::ReacquireEvents() const noexcept
+{
+    return reacquireEvents_;
+}
+
 inline VisualReject TrackingSessionPolicy::LastReject() const noexcept
 {
     return lastReject_;
@@ -410,6 +490,21 @@ inline VisualReject TrackingSessionPolicy::LastReject() const noexcept
 inline core::Transform2D TrackingSessionPolicy::LastRelative() const
 {
     return lastRelative_;
+}
+
+inline bool TrackingSessionPolicy::HasSecondaryAnchor() const noexcept
+{
+    return hasSecondaryAnchor_;
+}
+
+inline core::Transform2D TrackingSessionPolicy::SecondaryRelative() const
+{
+    return secondaryRelative_;
+}
+
+inline double TrackingSessionPolicy::OriginDriftRmsPx() const noexcept
+{
+    return lastOriginDriftRmsPx_;
 }
 
 inline std::uint64_t TrackingSessionPolicy::TargetGeneration() const noexcept
@@ -432,9 +527,15 @@ inline void TrackingSessionPolicy::DropKeyframe() noexcept
     hasKeyframe_ = false;
     hasTrustworthy_ = false;
     reacquireCount_ = 0;
+    reacquireEvents_ = 0;
     hasReacquireRef_ = false;
+    hasSecondaryAnchor_ = false;
+    secondaryRelative_ = core::Identity(core::Space::O, core::Space::O);
     lastRelative_ = core::Identity(core::Space::O, core::Space::O);
     lastReject_ = VisualReject::DegenerateSize;
+    lastAcceptedParity_ = VisualParity::None;
+    ResetParityStreak();
+    lastOriginDriftRmsPx_ = 0.0;
 }
 
 inline void TrackingSessionPolicy::BeginCalibrated(
@@ -566,6 +667,9 @@ inline void TrackingSessionPolicy::NoteKeyframeCaptured(
     lastReject_ = VisualReject::Ok;
     reacquireCount_ = 0;
     hasReacquireRef_ = false;
+    lastAcceptedParity_ = VisualParity::None;
+    ResetParityStreak();
+    lastOriginDriftRmsPx_ = 0.0;
     if (sequence > lastAcceptedSequence_)
     {
         lastAcceptedSequence_ = sequence;
@@ -585,76 +689,72 @@ inline bool TrackingSessionPolicy::EstimatesAgreeForReacquire(
     return !TransformSimilaritiesContradict(left, right, options);
 }
 
-inline TrackingApplyResult TrackingSessionPolicy::ApplyObservation(
+inline void TrackingSessionPolicy::ResetParityStreak() noexcept
+{
+    parityStreak_ = 0;
+    parityStreakParity_ = VisualParity::None;
+}
+
+inline bool TrackingSessionPolicy::ParityHysteresisAllows(
+    VisualParity incoming, VisualReject originReject) noexcept
+{
+    if (originReject != VisualReject::Ok || incoming == lastAcceptedParity_)
+    {
+        ResetParityStreak();
+        return true;
+    }
+
+    if (parityStreak_ == 0 || parityStreakParity_ != incoming)
+    {
+        parityStreakParity_ = incoming;
+        parityStreak_ = 1;
+    }
+    else
+    {
+        ++parityStreak_;
+    }
+    return parityStreak_ >= kParityHysteresisCount;
+}
+
+inline bool TrackingSessionPolicy::PromoteSecondaryAnchor() noexcept
+{
+    if (state_ != TrackingState::Tracking || !hasKeyframe_)
+    {
+        return false;
+    }
+    hasSecondaryAnchor_ = true;
+    secondaryRelative_ = lastRelative_;
+    return true;
+}
+
+inline TrackingApplyResult TrackingSessionPolicy::FinishAccept(
     TrackingFrameMeta const& meta,
-    VisualEstimate const& keyframeEstimate,
-    bool hasPrevious,
-    VisualEstimate const& previousEstimate,
+    VisualEstimate const& poseEstimate,
+    core::Transform2D const& chosenRelative,
+    double originDriftRmsPx,
+    bool usedSecondary,
+    VisualParity acceptedParity,
     TrackingSessionOptions const& options,
     std::chrono::steady_clock::time_point now) noexcept
 {
     TrackingApplyResult result{};
-    result.state = state_;
-    if (!TrackingAcceptsFrames(state_) || !generationValid_ || !hasKeyframe_)
-    {
-        result.action = TrackingApplyAction::Ignored;
-        return result;
-    }
-    if (!GenerationsMatch(meta) || meta.sequence <= lastAcceptedSequence_)
-    {
-        result.action = TrackingApplyAction::Ignored;
-        lastReject_ = keyframeEstimate.reject;
-        result.state = state_;
-        return result;
-    }
-
-    lastReject_ = keyframeEstimate.reject;
-    int const downsample = meta.downsample < 1 ? 1 : meta.downsample;
-
-    if (keyframeEstimate.reject != VisualReject::Ok)
-    {
-        result.action = TrackingApplyAction::RejectedQuality;
-        if (state_ == TrackingState::Tracking || state_ == TrackingState::Calibrating)
-        {
-            state_ = TrackingState::Degraded;
-        }
-        state_ = ApplyAgeLimit(
-            state_, hasTrustworthy_, ObservationAgeMs(now), options);
-        result.state = state_;
-        return result;
-    }
-
-    if (EstimatesContradict(
-            keyframeEstimate,
-            hasPrevious,
-            previousEstimate,
-            lastRelative_,
-            downsample,
-            options))
-    {
-        result.action = TrackingApplyAction::RejectedContradiction;
-        if (state_ == TrackingState::Tracking || state_ == TrackingState::Calibrating ||
-            state_ == TrackingState::Paused)
-        {
-            state_ = TrackingState::Degraded;
-        }
-        reacquireCount_ = 0;
-        hasReacquireRef_ = false;
-        state_ = ApplyAgeLimit(
-            state_, hasTrustworthy_, ObservationAgeMs(now), options);
-        result.state = state_;
-        return result;
-    }
-
-    lastRelative_ = SimilarityFromEstimate(keyframeEstimate, downsample);
+    lastRelative_ = chosenRelative;
     lastAcceptedSequence_ = meta.sequence;
     hasTrustworthy_ = true;
     lastTrustworthy_ = now;
+    lastReject_ = VisualReject::Ok;
+    lastOriginDriftRmsPx_ = originDriftRmsPx;
+    lastAcceptedParity_ = acceptedParity;
+    ResetParityStreak();
     result.accepted = true;
+    result.usedSecondary = usedSecondary;
+    result.originDriftRmsPx = originDriftRmsPx;
+    result.poseEstimate = poseEstimate;
+    result.poseEstimate.reject = VisualReject::Ok;
 
     if (state_ == TrackingState::Lost)
     {
-        if (!EstimatesAgreeForReacquire(keyframeEstimate, options))
+        if (!EstimatesAgreeForReacquire(poseEstimate, options))
         {
             reacquireCount_ = 1;
         }
@@ -662,13 +762,14 @@ inline TrackingApplyResult TrackingSessionPolicy::ApplyObservation(
         {
             ++reacquireCount_;
         }
-        lastReacquire_ = keyframeEstimate;
+        lastReacquire_ = poseEstimate;
         hasReacquireRef_ = true;
         if (reacquireCount_ >= options.reacquireCount)
         {
             state_ = TrackingState::Tracking;
             reacquireCount_ = 0;
             hasReacquireRef_ = false;
+            ++reacquireEvents_;
             result.action = TrackingApplyAction::Reacquired;
             result.state = state_;
             return result;
@@ -687,6 +788,153 @@ inline TrackingApplyResult TrackingSessionPolicy::ApplyObservation(
     result.action = TrackingApplyAction::Accepted;
     result.state = state_;
     return result;
+}
+
+inline TrackingApplyResult TrackingSessionPolicy::ApplyObservation(
+    TrackingFrameMeta const& meta,
+    VisualEstimate const& keyframeEstimate,
+    bool hasPrevious,
+    VisualEstimate const& previousEstimate,
+    TrackingSessionOptions const& options,
+    std::chrono::steady_clock::time_point now,
+    bool hasSecondaryEstimate,
+    VisualEstimate const& secondaryEstimate) noexcept
+{
+    TrackingApplyResult result{};
+    result.state = state_;
+    if (!TrackingAcceptsFrames(state_) || !generationValid_ || !hasKeyframe_)
+    {
+        result.action = TrackingApplyAction::Ignored;
+        return result;
+    }
+    if (!GenerationsMatch(meta) || meta.sequence <= lastAcceptedSequence_)
+    {
+        result.action = TrackingApplyAction::Ignored;
+        lastReject_ = keyframeEstimate.reject;
+        result.state = state_;
+        return result;
+    }
+
+    lastReject_ = keyframeEstimate.reject;
+    lastOriginDriftRmsPx_ = keyframeEstimate.rmsResidualPx;
+    result.originDriftRmsPx = keyframeEstimate.rmsResidualPx;
+    int const downsample = meta.downsample < 1 ? 1 : meta.downsample;
+
+    if (state_ == TrackingState::Paused)
+    {
+        result.action = keyframeEstimate.reject == VisualReject::ParityAmbiguous
+                            ? TrackingApplyAction::RejectedQuality
+                            : TrackingApplyAction::Ignored;
+        result.state = state_;
+        return result;
+    }
+
+    if (keyframeEstimate.reject == VisualReject::ParityAmbiguous)
+    {
+        ResetParityStreak();
+        Pause();
+        result.action = TrackingApplyAction::RejectedQuality;
+        result.state = state_;
+        return result;
+    }
+
+    auto secondaryComposed = [&]() -> std::optional<core::Transform2D> {
+        if (!hasSecondaryAnchor_ || !hasSecondaryEstimate ||
+            secondaryEstimate.reject != VisualReject::Ok)
+        {
+            return std::nullopt;
+        }
+        return core::Compose(
+            secondaryRelative_, SimilarityFromEstimate(secondaryEstimate, downsample));
+    };
+
+    if (keyframeEstimate.reject != VisualReject::Ok)
+    {
+        if (OriginRejectAllowsSecondaryRescue(keyframeEstimate.reject))
+        {
+            std::optional<core::Transform2D> const composed = secondaryComposed();
+            if (composed.has_value() &&
+                !TransformSimilaritiesContradict(*composed, lastRelative_, options))
+            {
+                return FinishAccept(
+                    meta,
+                    secondaryEstimate,
+                    *composed,
+                    keyframeEstimate.rmsResidualPx,
+                    true,
+                    lastAcceptedParity_,
+                    options,
+                    now);
+            }
+        }
+        result.action = TrackingApplyAction::RejectedQuality;
+        if (state_ == TrackingState::Tracking || state_ == TrackingState::Calibrating)
+        {
+            state_ = TrackingState::Degraded;
+        }
+        state_ = ApplyAgeLimit(state_, hasTrustworthy_, ObservationAgeMs(now), options);
+        result.state = state_;
+        return result;
+    }
+
+    VisualParity const incoming = EstimateParity(keyframeEstimate);
+    bool const parityChanged = incoming != lastAcceptedParity_;
+    if (!ParityHysteresisAllows(incoming, keyframeEstimate.reject))
+    {
+        result.action = TrackingApplyAction::RejectedQuality;
+        if (state_ == TrackingState::Tracking || state_ == TrackingState::Calibrating)
+        {
+            state_ = TrackingState::Degraded;
+        }
+        state_ = ApplyAgeLimit(state_, hasTrustworthy_, ObservationAgeMs(now), options);
+        result.state = state_;
+        return result;
+    }
+
+    if (!parityChanged &&
+        EstimatesContradict(
+            keyframeEstimate,
+            hasPrevious,
+            previousEstimate,
+            lastRelative_,
+            downsample,
+            options))
+    {
+        result.action = TrackingApplyAction::RejectedContradiction;
+        if (state_ == TrackingState::Tracking || state_ == TrackingState::Calibrating)
+        {
+            state_ = TrackingState::Degraded;
+        }
+        reacquireCount_ = 0;
+        hasReacquireRef_ = false;
+        ResetParityStreak();
+        state_ = ApplyAgeLimit(state_, hasTrustworthy_, ObservationAgeMs(now), options);
+        result.state = state_;
+        return result;
+    }
+
+    core::Transform2D chosen = SimilarityFromEstimate(keyframeEstimate, downsample);
+    VisualEstimate poseEstimate = keyframeEstimate;
+    bool usedSecondary = false;
+    std::optional<core::Transform2D> const composed = secondaryComposed();
+    if (composed.has_value() &&
+        !TransformSimilaritiesContradict(chosen, *composed, options) &&
+        secondaryEstimate.rmsResidualPx + 1.0e-9 < keyframeEstimate.rmsResidualPx)
+    {
+        chosen = *composed;
+        poseEstimate = secondaryEstimate;
+        usedSecondary = true;
+    }
+
+    return FinishAccept(
+        meta,
+        poseEstimate,
+        chosen,
+        keyframeEstimate.rmsResidualPx,
+        usedSecondary,
+        incoming,
+        options,
+        now);
 }
 
 inline void TrackingSessionPolicy::Tick(
@@ -742,10 +990,13 @@ public:
         VisualEstimate const& keyframeEstimate,
         bool hasPrevious,
         VisualEstimate const& previousEstimate,
-        std::chrono::steady_clock::time_point now);
+        std::chrono::steady_clock::time_point now,
+        bool hasSecondaryEstimate = false,
+        VisualEstimate const& secondaryEstimate = {});
     void CaptureKeyframeForTest(
         TrackingFrameMeta const& meta,
         std::chrono::steady_clock::time_point now);
+    void PromoteSecondaryAnchorForTest();
     void Tick(std::chrono::steady_clock::time_point now);
 
     TransformSnapshot Snapshot() const;
@@ -775,7 +1026,9 @@ private:
     core::Vec2 viewportAnchorS_{};
     TrackingRoiFrame keyframe_{};
     TrackingRoiFrame previous_{};
+    TrackingRoiFrame secondary_{};
     bool hasPreviousFrame_ = false;
+    bool hasSecondaryFrame_ = false;
     PendingFrame pending_[2]{};
     std::size_t pendingCount_ = 0;
     TransformSnapshot snapshot_{};
