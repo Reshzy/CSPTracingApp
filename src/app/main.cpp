@@ -118,6 +118,7 @@ constexpr int kIdProbeUia = 1063;
 constexpr int kIdHybridFusion = 1064;
 constexpr int kIdObsVerify = 1065;
 constexpr int kIdImageReplay = 1066;
+constexpr int kIdSimulateGpuLoss = 1067;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -209,6 +210,10 @@ struct ControlState
     std::uint64_t lastReplayImageSequence = 0;
     LiveCalibration calibration;
     bool hideOverlayOnCaptureLoss = false;
+    bool recoveringGpu = false;
+    bool deviceLossRecorded = false;
+    bool deviceLossSimulated = false;
+    HRESULT deviceLossReason = S_OK;
     bool obsSkipOverlayImagePresent = false;
     std::uint64_t nextGeneration = 1;
     std::uint64_t lastFedRoiSequence = 0;
@@ -300,6 +305,27 @@ bool CalibrationIsLive(ControlState const& state) noexcept
 {
     return state.calibration.roiApplied &&
            state.calibration.lastInvalidation == tracing::core::CalibrationInvalidation::None;
+}
+
+std::wstring FormatHresultWide(HRESULT value)
+{
+    wchar_t buffer[16]{};
+    swprintf_s(buffer, L"0x%08X", static_cast<unsigned>(value));
+    return buffer;
+}
+
+std::wstring FormatDeviceLossLine(ControlState const& state)
+{
+    if (!state.deviceLossRecorded)
+    {
+        return L"deviceLoss=none removed=0x00000000";
+    }
+    if (state.deviceLossSimulated)
+    {
+        return L"deviceLoss=simulated (not a driver reset) removed=" +
+               FormatHresultWide(state.deviceLossReason);
+    }
+    return L"deviceLoss=GetDeviceRemovedReason removed=" + FormatHresultWide(state.deviceLossReason);
 }
 
 template <typename RoiRequest>
@@ -539,6 +565,7 @@ void RefreshCalibrationValidity(ControlState& state)
     {
         state.calibration.roiApplied = false;
         state.calibration.lastInvalidation = reason;
+        state.hideOverlayOnCaptureLoss = true;
         state.tracking.Detach();
         state.navigator.Disable();
         ResetRoiFeed(state);
@@ -733,7 +760,8 @@ std::wstring StatusHeader(ControlState const& state)
            state.image.FormatReport() + L"\r\n" +
            state.renderer.FormatReport() + L"\r\n" +
            state.reference.FormatReport() + L"\r\n" +
-           L"overlayPresentPath=dxgi-hwnd (not ulw, not dcomp; OBS verification is user-recorded)\r\n"
+           L"overlayPresentPath=dxgi-hwnd (not ulw, not dcomp; OBS verification is user-recorded)\r\n" +
+           FormatDeviceLossLine(state) + L"\r\n"
            L"overlayHiddenOnCaptureLoss=" +
            std::wstring(state.hideOverlayOnCaptureLoss ? L"yes" : L"no") +
            L" obsSkipOverlayImagePresent=" +
@@ -1051,6 +1079,8 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
         if (sampled.identity == tracing::platform::IdentityCheck::WindowDead ||
             sampled.identity == tracing::platform::IdentityCheck::HandleReused)
         {
+            state.tracking.MarkUnavailable();
+            state.hideOverlayOnCaptureLoss = true;
             StopCapture(state);
             StopWatching(state);
             state.selected.reset();
@@ -1185,6 +1215,8 @@ void RefreshCandidates(ControlState& state)
             observed.creationTime);
         if (check == tracing::platform::IdentityCheck::WindowDead)
         {
+            state.tracking.MarkUnavailable();
+            state.hideOverlayOnCaptureLoss = true;
             StopCapture(state);
             StopWatching(state);
             state.selected.reset();
@@ -1197,6 +1229,8 @@ void RefreshCandidates(ControlState& state)
         }
         if (check == tracing::platform::IdentityCheck::HandleReused)
         {
+            state.tracking.MarkUnavailable();
+            state.hideOverlayOnCaptureLoss = true;
             StopCapture(state);
             StopWatching(state);
             state.selected.reset();
@@ -1620,6 +1654,132 @@ void OnObsSkipOverlayImage(ControlState& state)
             : L"OBS overlay test-pattern off: imported image presents onto the overlay.");
 }
 
+void RecoverGpuResources(ControlState& state, bool simulated, HRESULT removedReason)
+{
+    if (state.recoveringGpu)
+    {
+        return;
+    }
+    state.recoveringGpu = true;
+    state.hideOverlayOnCaptureLoss = true;
+    state.deviceLossRecorded = true;
+    state.deviceLossSimulated = simulated;
+    state.deviceLossReason = simulated ? S_OK : removedReason;
+    state.overlay.EmergencyHide();
+
+    bool const referenceWasVisible = state.reference.IsVisible();
+    bool const previewEnabled = state.preview.IsEnabled();
+
+    state.capture.Stop();
+    state.tracking.MarkUnavailable();
+    ResetLiveCalibration(state);
+    if (state.selected.has_value())
+    {
+        state.input.AttachSession(
+            reinterpret_cast<std::uintptr_t>(state.selected->hwnd),
+            state.selected->process.pid,
+            state.selected->sessionGeneration);
+        state.accessibility.AttachSession(
+            reinterpret_cast<std::uintptr_t>(state.selected->hwnd),
+            state.selected->process.pid,
+            state.selected->sessionGeneration);
+        if (state.predEnableCheck != nullptr &&
+            SendMessageW(state.predEnableCheck, BM_GETCHECK, 0, 0) == BST_CHECKED)
+        {
+            state.input.Enable();
+        }
+    }
+
+    state.preview.Release();
+    state.reference.Release();
+    state.renderer.Release();
+    state.overlay.Release();
+
+    std::wstring error;
+    if (!state.device.Create(error))
+    {
+        state.recoveringGpu = false;
+        SetStatusWithOverlay(
+            state,
+            L"GPU recovery: D3D11 Create failed. Overlay stays hidden.\r\n" + error + L"\r\n" +
+                FormatDeviceLossLine(state));
+        return;
+    }
+
+    if (state.control == nullptr || !state.overlay.Create(state.control, state.device, error))
+    {
+        state.recoveringGpu = false;
+        SetStatusWithOverlay(
+            state,
+            L"GPU recovery: overlay HWND recreate failed. Overlay stays hidden.\r\n" + error +
+                L"\r\n" + FormatDeviceLossLine(state));
+        return;
+    }
+
+    std::wstring extra;
+    std::wstring previewError;
+    if (!state.preview.Create(state.control, state.device, previewError))
+    {
+        extra += L"\r\npreview recreate failed: " + previewError;
+    }
+    else
+    {
+        state.preview.SetEnabled(previewEnabled);
+    }
+
+    std::wstring rendererError;
+    if (!state.renderer.Create(state.device, rendererError))
+    {
+        extra += L"\r\nrenderer recreate failed: " + rendererError;
+    }
+    else if (state.image.Image() != nullptr)
+    {
+        std::wstring uploadError;
+        if (!state.renderer.Upload(*state.image.Image(), uploadError))
+        {
+            extra += L"\r\nimage re-upload failed: " + uploadError;
+        }
+    }
+
+    std::wstring referenceError;
+    if (!state.reference.Create(state.control, state.device, referenceError))
+    {
+        extra += L"\r\nreference recreate failed: " + referenceError;
+    }
+    else if (referenceWasVisible && state.renderer.HasTexture())
+    {
+        std::wstring showError;
+        if (!state.reference.Show(state.renderer, showError))
+        {
+            extra += L"\r\nreference show failed: " + showError;
+        }
+    }
+
+    state.recoveringGpu = false;
+    SetStatusWithOverlay(
+        state,
+        std::wstring(
+            L"GPU resources rebuilt in order; affinity reapplied before overlay show. Overlay stays "
+            L"hidden until Apply ROI (device ready) or Start Capture with live calibration. ") +
+            FormatDeviceLossLine(state) + extra);
+}
+
+void HandlePossibleGpuLoss(ControlState& state)
+{
+    HRESULT reason = S_OK;
+    bool const removed = state.device.CheckDeviceRemoved(reason);
+    if (!removed)
+    {
+        return;
+    }
+    RecoverGpuResources(state, false, reason);
+}
+
+void OnSimulateGpuLoss(ControlState& state)
+{
+    RecoverGpuResources(state, true, S_OK);
+}
+
 void OnRecreateOverlay(ControlState& state)
 {
     if (!state.device.IsReady())
@@ -1715,6 +1875,10 @@ void OnApplyRoi(ControlState& state)
     ++state.calibration.calibrationGeneration;
     ApplyDerivedImagePlacement(state);
     SyncCaptureRoiRequests(state);
+    if (state.device.IsReady())
+    {
+        state.hideOverlayOnCaptureLoss = false;
+    }
     SetStatusWithOverlay(
         state,
         L"Applied canvas ROI in client-relative pixels. Overlay HWND clipped to ROI. "
@@ -2337,7 +2501,10 @@ void StartCaptureNow(ControlState& state)
         SetStatusWithOverlay(state, error);
         return;
     }
-    state.hideOverlayOnCaptureLoss = false;
+    if (CalibrationIsLive(state))
+    {
+        state.hideOverlayOnCaptureLoss = false;
+    }
     SyncCaptureRoiRequests(state);
     RefreshGeometryDisplay(
         state,
@@ -2708,6 +2875,19 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             28,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdRecreateOverlay)),
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Simulate GPU loss",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            464,
+            376,
+            228,
+            28,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdSimulateGpuLoss)),
             instance,
             nullptr);
         CreateWindowExW(
@@ -3183,6 +3363,11 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 OnRecreateOverlay(*state);
                 return 0;
             }
+            if (id == kIdSimulateGpuLoss && code == BN_CLICKED)
+            {
+                OnSimulateGpuLoss(*state);
+                return 0;
+            }
             if (id == kIdTransformDiag && code == BN_CLICKED)
             {
                 OnTransformDiag(*state);
@@ -3282,9 +3467,15 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 RefreshGeometryDisplay(*state, L"WGC item Closed; session torn down; tracing overlay hidden.");
                 return 0;
             }
+            if (wParam == 2)
+            {
+                HandlePossibleGpuLoss(*state);
+                return 0;
+            }
             RefreshCalibrationValidity(*state);
             SyncCaptureRoiRequests(*state);
             state->capture.PumpHandoff();
+            HandlePossibleGpuLoss(*state);
             FeedTrackingFromRoi(*state);
             FeedNavigatorFromRoi(*state);
             FeedInputVisualCorrection(*state);
@@ -3336,6 +3527,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
         if (state != nullptr && wParam == kTimerGeometry && state->selected.has_value())
         {
             TickInputPrediction(*state);
+            HandlePossibleGpuLoss(*state);
             RefreshGeometryDisplay(*state, L"");
             return 0;
         }
@@ -3355,6 +3547,8 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 state->rawInputRegistered = false;
             }
             KillTimer(hwnd, kTimerInputPred);
+            state->overlay.EmergencyHide();
+            state->hideOverlayOnCaptureLoss = true;
             StopCapture(*state);
             state->tracking.Stop();
             state->input.Detach();

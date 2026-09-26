@@ -394,6 +394,79 @@ TEST(TrackingSession, StopFromSubmitThreadDoesNotDeadlock)
     session.Stop();
 }
 
+TEST(TrackingSession, MarkUnavailableHidesAndRejectsFrames)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    TransformSnapshot const before = session.Snapshot();
+    EXPECT_TRUE(before.hasKeyframe);
+    EXPECT_FALSE(before.hideOverlay);
+
+    session.MarkUnavailable();
+    TransformSnapshot const snap = session.Snapshot();
+    EXPECT_EQ(snap.state, TrackingState::Unavailable);
+    EXPECT_TRUE(snap.hideOverlay);
+    EXPECT_FALSE(snap.hasKeyframe);
+    EXPECT_STREQ(FormatTrackingState(snap.state), "Unavailable");
+
+    TrackingRoiFrame frame{};
+    frame.meta = Meta(2);
+    frame.bgra.assign(static_cast<std::size_t>(frame.meta.stride * frame.meta.height), 80);
+    EXPECT_EQ(session.SubmitRoiFrame(std::move(frame)), TrackingFrameAction::RejectNotCalibrated);
+}
+
+TEST(TrackingSession, BeginCalibratedAfterUnavailableRequiresFreshKeyframe)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    session.MarkUnavailable();
+    EXPECT_TRUE(session.Snapshot().hideOverlay);
+
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    TransformSnapshot const afterBegin = session.Snapshot();
+    EXPECT_EQ(afterBegin.state, TrackingState::Calibrating);
+    EXPECT_FALSE(afterBegin.hasKeyframe);
+    EXPECT_FALSE(afterBegin.hideOverlay);
+
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    TransformSnapshot const afterKey = session.Snapshot();
+    EXPECT_TRUE(afterKey.hasKeyframe);
+    EXPECT_FALSE(afterKey.hideOverlay);
+    EXPECT_EQ(afterKey.sequence, 1u);
+}
+
+TEST(TrackingSession, PendingThenUnavailableThenStopDoesNotDeadlock)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+
+    TrackingRoiFrame frame{};
+    frame.meta = Meta(1);
+    frame.bgra.assign(static_cast<std::size_t>(frame.meta.stride * frame.meta.height), 80);
+    TrackingFrameAction const action = session.SubmitRoiFrame(std::move(frame));
+    EXPECT_TRUE(
+        action == TrackingFrameAction::Enqueue ||
+        action == TrackingFrameAction::DropOldestThenEnqueue);
+
+    session.MarkUnavailable();
+    TransformSnapshot const snap = session.Snapshot();
+    EXPECT_EQ(snap.state, TrackingState::Unavailable);
+    EXPECT_TRUE(snap.hideOverlay);
+
+    session.Stop();
+    TransformSnapshot const afterStop = session.Snapshot();
+    EXPECT_EQ(afterStop.state, TrackingState::Unattached);
+    EXPECT_FALSE(afterStop.hideOverlay);
+    session.Stop();
+}
+
 TEST(TrackingSession, WorkerTexturedTranslationMovesSnapshot)
 {
     TrackingSession session;

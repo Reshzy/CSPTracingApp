@@ -615,8 +615,9 @@ inline void TrackingSessionPolicy::MarkUnavailable() noexcept
 {
     state_ = TrackingState::Unavailable;
     generationValid_ = false;
+    lastAcceptedSequence_ = 0;
     pending_ = 0;
-    hasTrustworthy_ = false;
+    DropKeyframe();
 }
 
 inline void TrackingSessionPolicy::NoteGeometryGeneration(std::uint64_t geometryGeneration) noexcept

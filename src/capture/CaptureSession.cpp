@@ -98,6 +98,31 @@ RoiCpuSnapshot PackRoiSnapshot(RoiCpuBuffer const& packed)
     return snapshot;
 }
 
+bool IsDxgiDeviceLost(HRESULT hr) noexcept
+{
+    return hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+           hr == DXGI_ERROR_DEVICE_HUNG;
+}
+
+bool NoteDeviceLostAfterGpu(
+    graphics::DeviceResources* gpu,
+    HRESULT& copyHr,
+    std::wstring& error)
+{
+    HRESULT removed = S_OK;
+    bool const removedByDevice = gpu != nullptr && gpu->CheckDeviceRemoved(removed);
+    if (!removedByDevice && !IsDxgiDeviceLost(copyHr))
+    {
+        return false;
+    }
+    if (!FAILED(copyHr))
+    {
+        copyHr = removed != S_OK ? removed : DXGI_ERROR_DEVICE_REMOVED;
+    }
+    error = L"WGC owned copy aborted: device removed HRESULT=" + FormatHresult(copyHr);
+    return true;
+}
+
 } // namespace
 
 struct CaptureSession::Impl
@@ -469,6 +494,10 @@ bool CaptureSession::Impl::CopyOwned(PendingItem& pendingItem, HRESULT& copyHr, 
         if (FAILED(copyHr) || !ownedTexture)
         {
             CloseFrameQuiet(pendingItem.frame);
+            if (NoteDeviceLostAfterGpu(gpu, copyHr, error))
+            {
+                return false;
+            }
             error = L"CreateTexture2D owned capture copy failed HRESULT=" + FormatHresult(copyHr);
             return false;
         }
@@ -494,6 +523,14 @@ bool CaptureSession::Impl::CopyOwned(PendingItem& pendingItem, HRESULT& copyHr, 
         0,
         &box);
     CloseFrameQuiet(pendingItem.frame);
+    if (NoteDeviceLostAfterGpu(gpu, copyHr, error))
+    {
+        ownedTexture.Reset();
+        ownedWidth = 0;
+        ownedHeight = 0;
+        ownedFormat = DXGI_FORMAT_UNKNOWN;
+        return false;
+    }
     return true;
 }
 
@@ -751,6 +788,39 @@ void CaptureSession::PumpHandoff()
     std::wstring copyError;
     bool const copied = impl_->CopyOwned(latest, copyHr, copyError);
 
+    auto abortOnDeviceLost = [this](HRESULT hr) -> bool {
+        HWND notify = nullptr;
+        UINT message = 0;
+        HRESULT removed = S_OK;
+        graphics::DeviceResources* gpu = nullptr;
+        {
+            std::lock_guard<std::mutex> const lock(impl_->mutex);
+            gpu = impl_->device;
+            notify = impl_->notifyWindow;
+            message = impl_->notifyMessage;
+        }
+        bool const lost =
+            (gpu != nullptr && gpu->CheckDeviceRemoved(removed)) || IsDxgiDeviceLost(hr);
+        if (!lost)
+        {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> const lock(impl_->mutex);
+            impl_->lastHr = FAILED(hr) ? hr : (removed != S_OK ? removed : DXGI_ERROR_DEVICE_REMOVED);
+        }
+        Stop();
+        if (notify != nullptr && message != 0)
+        {
+            PostMessageW(notify, message, 2, 0);
+        }
+        return true;
+    };
+    if (abortOnDeviceLost(copyHr))
+    {
+        return;
+    }
+
     std::wstring roiError;
     std::wstring lastRoiSrc;
     bool haveRoiSrc = false;
@@ -861,6 +931,10 @@ void CaptureSession::PumpHandoff()
         latest.packet.contentHeight,
         recreateHr,
         recreateError);
+    if (abortOnDeviceLost(recreateHr))
+    {
+        return;
+    }
 
     {
         std::lock_guard<std::mutex> const lock(impl_->mutex);

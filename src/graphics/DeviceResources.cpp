@@ -25,6 +25,44 @@ std::wstring FormatHex32(std::uint32_t value)
     return buffer;
 }
 
+bool IsDeviceLostReason(HRESULT reason) noexcept
+{
+    return reason != S_OK;
+}
+
+void DropDeviceObjects(
+    Microsoft::WRL::ComPtr<ID3D11Device>& device,
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext>& context,
+    Microsoft::WRL::ComPtr<ID3D11Debug>& debug,
+    DeviceInfo& info,
+    bool skipFlush) noexcept
+{
+    if (device && !debug)
+    {
+        (void)device.As(&debug);
+    }
+
+    if (context)
+    {
+        if (!skipFlush)
+        {
+            context->ClearState();
+            context->Flush();
+        }
+        context.Reset();
+    }
+
+    device.Reset();
+
+    if (debug)
+    {
+        debug->ReportLiveDeviceObjects(
+            static_cast<D3D11_RLDO_FLAGS>(D3D11_RLDO_DETAIL | D3D11_RLDO_IGNORE_INTERNAL));
+        info.liveObjectsReported = true;
+        debug.Reset();
+    }
+}
+
 } // namespace
 
 DeviceResources::~DeviceResources()
@@ -101,9 +139,23 @@ void DeviceResources::CaptureAdapterIdentity()
 bool DeviceResources::Create(std::wstring& error)
 {
     error.clear();
-    Release();
-    policy_ = DeviceLifecyclePolicy(policy_.MaxRetries());
+    bool const retrying =
+        policy_.State() == DeviceLifecycleState::Removed && policy_.CanRetry();
+    HRESULT const previousRemoved = info_.lastDeviceRemovedReason;
+    bool const skipFlush =
+        retrying || policy_.State() == DeviceLifecycleState::Removed ||
+        IsDeviceLostReason(info_.lastDeviceRemovedReason);
+    DropDeviceObjects(device_, context_, debug_, info_, skipFlush);
+    if (retrying)
+    {
+        policy_.Apply(DeviceLifecycleEvent::Retry);
+    }
+    else
+    {
+        policy_ = DeviceLifecyclePolicy(policy_.MaxRetries());
+    }
     info_ = {};
+    info_.lastDeviceRemovedReason = previousRemoved;
 
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
 #if defined(_DEBUG)
@@ -158,28 +210,9 @@ void DeviceResources::Release()
         return;
     }
 
-    if (device_ && !debug_)
-    {
-        (void)device_.As(&debug_);
-    }
-
-    if (context_)
-    {
-        context_->ClearState();
-        context_->Flush();
-        context_.Reset();
-    }
-
-    device_.Reset();
-
-    if (debug_)
-    {
-        debug_->ReportLiveDeviceObjects(
-            static_cast<D3D11_RLDO_FLAGS>(D3D11_RLDO_DETAIL | D3D11_RLDO_IGNORE_INTERNAL));
-        info_.liveObjectsReported = true;
-        debug_.Reset();
-    }
-
+    bool const skipFlush = policy_.State() == DeviceLifecycleState::Removed ||
+                           IsDeviceLostReason(info_.lastDeviceRemovedReason);
+    DropDeviceObjects(device_, context_, debug_, info_, skipFlush);
     policy_.Apply(DeviceLifecycleEvent::Shutdown);
 }
 
@@ -256,7 +289,9 @@ std::wstring DeviceResources::FormatReport() const
     return L"D3D11 adapter=\"" + adapter + L"\" vendor=0x" + FormatHex32(info_.adapter.vendorId) +
            L" device=0x" + FormatHex32(info_.adapter.deviceId) + L" featureLevel=" +
            FormatFeatureLevel(info_.featureLevel) + L" state=" +
-           FormatDeviceLifecycleState(policy_.State()) + L"\r\n" + L"debugLayer requested=" +
+           FormatDeviceLifecycleState(policy_.State()) + L" retryCount=" +
+           std::to_wstring(policy_.RetryCount()) + L" canRetry=" +
+           std::wstring(policy_.CanRetry() ? L"yes" : L"no") + L"\r\n" + L"debugLayer requested=" +
            (info_.debugLayerRequested ? L"yes" : L"no") + L" " + debug + L" create=" +
            FormatHresult(info_.lastCreateResult) + L" removed=" +
            FormatHresult(info_.lastDeviceRemovedReason) + L" liveObjectsReported=" +

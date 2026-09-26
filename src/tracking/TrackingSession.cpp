@@ -335,9 +335,17 @@ void TrackingSession::MarkUnavailable()
 {
     std::lock_guard<std::mutex> const lock(mutex_);
     policy_.MarkUnavailable();
+    keyframe_ = {};
+    previous_ = {};
+    secondary_ = {};
+    hasPreviousFrame_ = false;
+    hasSecondaryFrame_ = false;
     pending_[0] = {};
     pending_[1] = {};
     pendingCount_ = 0;
+    lastEstimate_ = {};
+    pausedForParity_ = false;
+    ResetFusionLocked();
     snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
 }
 
