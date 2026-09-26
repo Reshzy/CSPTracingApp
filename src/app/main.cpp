@@ -40,6 +40,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
 #include "platform/InputObserver.h"
+#include "platform/AccessibilityObserver.h"
 #include "app/ReferenceWindow.h"
 #include "tracking/TrackingSession.h"
 #include "tracking/NavigatorObserver.h"
@@ -111,10 +112,12 @@ constexpr int kIdPredPan = 1059;
 constexpr int kIdPredRot = 1060;
 constexpr int kIdApplyPredMapping = 1061;
 constexpr int kIdEnablePred = 1062;
+constexpr int kIdProbeUia = 1063;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
 constexpr UINT kMsgStopCapture = WM_APP + 4;
+constexpr UINT kMsgUiaProbeDone = WM_APP + 5;
 constexpr UINT_PTR kTimerGeometry = 1;
 constexpr UINT_PTR kTimerInputPred = 2;
 constexpr UINT kGeometryPollMs = 250;
@@ -166,6 +169,7 @@ struct ControlState
     tracing::tracking::TrackingSession tracking;
     tracing::tracking::NavigatorObserver navigator;
     tracing::platform::InputObserver input;
+    tracing::platform::AccessibilityObserver accessibility;
     HWND previewCheck = nullptr;
     HWND opacityTrack = nullptr;
     HWND obsPositiveControlCheck = nullptr;
@@ -363,6 +367,7 @@ void ResetLiveCalibration(ControlState& state)
     state.tracking.Detach();
     state.navigator.Disable();
     state.input.Detach();
+    state.accessibility.Detach();
     state.visualDeltaHasPrevious = false;
     state.visualDeltaSequence = 0;
     if (state.control != nullptr)
@@ -598,7 +603,15 @@ std::wstring StatusHeader(ControlState const& state)
            L" rawInput=" +
            std::wstring(state.rawInputRegistered ? L"ok" : L"fail") +
            L" err=" + std::to_wstring(state.rawInputError) +
-           L" (mouse HID observe only; no NOLEGACY; unfused)\r\n";
+           L" (mouse HID observe only; no NOLEGACY; unfused)\r\n" +
+           WidenAscii(tracing::platform::FormatAccessibilityReport(state.accessibility.Last())) +
+           L" uiaEnabled=" +
+           std::wstring(state.accessibility.Enabled() ? L"yes" : L"no") +
+           L" uiaSession=" +
+           std::wstring(state.accessibility.SessionAttached() ? L"yes" : L"no") +
+           L" uiaProbing=" +
+           std::wstring(state.accessibility.Probing() ? L"yes" : L"no") +
+           L" (read-only probe; not fused; not tracking)\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -1059,6 +1072,10 @@ void SelectFromUi(ControlState& state)
     ++state.nextGeneration;
     ResetLiveCalibration(state);
     state.input.AttachSession(
+        reinterpret_cast<std::uintptr_t>(state.selected->hwnd),
+        state.selected->process.pid,
+        state.selected->sessionGeneration);
+    state.accessibility.AttachSession(
         reinterpret_cast<std::uintptr_t>(state.selected->hwnd),
         state.selected->process.pid,
         state.selected->sessionGeneration);
@@ -1820,6 +1837,49 @@ void OnEnablePred(ControlState& state)
         state,
         L"Input prediction enabled for the selected foreground session only. "
         L"Events are observed, not injected; CSP apply is not assumed; overlay is unfused.");
+}
+
+void OnProbeUia(ControlState& state)
+{
+    if (!state.accessibility.SessionAttached())
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Probe UIA: no session. Select a target first. Adapter stays disabled; "
+            L"unsupported is valid. Not fused into tracking.");
+        return;
+    }
+    if (state.accessibility.Probing())
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Probe UIA already running on a worker. UI thread is not walking the tree.");
+        return;
+    }
+    if (!state.accessibility.BeginProbe(
+            reinterpret_cast<std::uintptr_t>(state.control),
+            kMsgUiaProbeDone))
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Probe UIA did not start. " +
+                WidenAscii(tracing::platform::FormatAccessibilityReport(state.accessibility.Last())) +
+                L" Adapter is not used for tracking.");
+        return;
+    }
+    SetStatusWithOverlay(
+        state,
+        L"UIA probe started on a worker (UI thread not walking). Read-only; no Invoke/SetValue. "
+        L"Unsupported is a valid outcome.");
+}
+
+void OnUiaProbeDone(ControlState& state, std::uint64_t postedGeneration)
+{
+    state.accessibility.ApplyCompletedProbe(postedGeneration);
+    SetStatusWithOverlay(
+        state,
+        L"UIA probe finished. Observed properties only; no CSP-support claim. "
+        L"Adapter is not fused into overlay or tracking.");
 }
 
 bool HandleCalibrationCommand(ControlState& state, int id)
@@ -2684,14 +2744,15 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             instance,
             nullptr);
         SendMessageW(created->predEnableCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+        addButton(L"Probe UIA", 508, 516, 90, 24, kIdProbeUia);
         CreateWindowExW(
             0,
             L"STATIC",
-            L"off until mapping; mouse observe only; not fused",
+            L"off until mapping; UIA optional",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-            508,
+            602,
             516,
-            184,
+            90,
             24,
             hwnd,
             nullptr,
@@ -2869,6 +2930,11 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 OnEnablePred(*state);
                 return 0;
             }
+            if (id == kIdProbeUia && code == BN_CLICKED)
+            {
+                OnProbeUia(*state);
+                return 0;
+            }
             if (code == BN_CLICKED && HandleCalibrationCommand(*state, id))
             {
                 return 0;
@@ -2939,6 +3005,13 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             return 0;
         }
         break;
+    case kMsgUiaProbeDone:
+        if (state != nullptr)
+        {
+            OnUiaProbeDone(*state, static_cast<std::uint64_t>(wParam));
+            return 0;
+        }
+        break;
     case WM_INPUT:
         if (state != nullptr)
         {
@@ -2977,6 +3050,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             StopCapture(*state);
             state->tracking.Stop();
             state->input.Detach();
+            state->accessibility.Detach();
             StopWatching(*state);
             state->reference.Release();
             state->preview.Release();
