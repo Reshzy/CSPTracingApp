@@ -96,6 +96,10 @@ struct TransformSnapshot
     int inlierCount = 0;
     double rmsResidualPx = 0.0;
     VisualReject lastReject = VisualReject::DegenerateSize;
+    bool flipX = false;
+    bool flipY = false;
+    double driftRmsPx = 0.0;
+    int reacquireCount = 0;
 };
 
 struct TrackingHandoffResult
@@ -171,11 +175,18 @@ inline core::Transform2D MakeOverlaySimilarity(
 inline core::Transform2D SimilarityFromEstimate(VisualEstimate const& estimate, int downsample)
 {
     int const ds = downsample < 1 ? 1 : downsample;
-    return MakeOverlaySimilarity(
+    core::Transform2D const similarity = MakeOverlaySimilarity(
         estimate.uniformScale,
         estimate.radiansClockwise,
         estimate.tx * static_cast<double>(ds),
         estimate.ty * static_cast<double>(ds));
+    if (!estimate.flipX && !estimate.flipY)
+    {
+        return similarity;
+    }
+    core::Transform2D const flip =
+        core::Flip(core::Space::O, core::Space::O, estimate.flipX, estimate.flipY);
+    return core::Compose(flip, similarity).value_or(similarity);
 }
 
 inline bool TransformSimilaritiesContradict(
@@ -769,6 +780,7 @@ private:
     std::size_t pendingCount_ = 0;
     TransformSnapshot snapshot_{};
     VisualEstimate lastEstimate_{};
+    bool pausedForParity_ = false;
 };
 
 } // namespace tracing::tracking

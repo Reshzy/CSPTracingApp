@@ -7,12 +7,21 @@ namespace tracing::tracking {
 
 // Canvas-to-canvas visual estimator. Compares prior/keyframe CSP pixels with
 // current CSP pixels. Does not accept an imported tracing reference. Reflection
-// is rejected, not recovered, in this step.
+// is recovered by explicit mirrored-source hypotheses, then an
+// orientation-preserving fit. FlipX*FlipY is canonicalized to a 180-degree
+// rotation (no reflection flags). Ambiguous parity is rejected, not guessed.
 
 enum class PixelFormat
 {
     Gray8,
     Bgra32,
+};
+
+enum class VisualParity
+{
+    None,
+    FlipX,
+    FlipY,
 };
 
 struct CanvasView
@@ -45,6 +54,7 @@ enum class VisualReject
     ShearOrNonuniformScale,
     ImplausibleMotion,
     ReflectionUnsupported,
+    ParityAmbiguous,
     NonFinite,
 };
 
@@ -67,6 +77,8 @@ struct VisualTrackerOptions
     double maxShear = 0.12;
     double maxScaleAnisotropy = 0.12;
     double reflectionDetEpsilon = 1e-6;
+    double parityMargin = 0.08;
+    VisualParity preferredParity = VisualParity::None;
     std::uint64_t rngSeed = 1;
 };
 
@@ -77,6 +89,9 @@ struct VisualEstimate
     double ty = 0.0;
     double uniformScale = 1.0;
     double radiansClockwise = 0.0;
+    bool flipX = false;
+    bool flipY = false;
+    VisualParity parity = VisualParity::None;
     int featureCount = 0;
     int matchCount = 0;
     int inlierCount = 0;
@@ -88,7 +103,21 @@ struct VisualEstimate
     double confidence = 0.0;
 };
 
+inline VisualParity VisualParityFromFlags(bool flipX, bool flipY) noexcept
+{
+    if (flipX && !flipY)
+    {
+        return VisualParity::FlipX;
+    }
+    if (!flipX && flipY)
+    {
+        return VisualParity::FlipY;
+    }
+    return VisualParity::None;
+}
+
 char const* VisualRejectName(VisualReject reject) noexcept;
+char const* VisualParityName(VisualParity parity) noexcept;
 
 VisualEstimate EstimateFromCorrespondences(
     Correspondence const* points,

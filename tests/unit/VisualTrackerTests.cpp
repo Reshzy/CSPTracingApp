@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
 #include "core/Transform2D.h"
+#include "tracking/TrackingSession.h"
 #include "tracking/VisualTracker.h"
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -29,7 +31,10 @@ using tracing::tracking::Correspondence;
 using tracing::tracking::EstimateCanvasMotion;
 using tracing::tracking::EstimateFromCorrespondences;
 using tracing::tracking::PixelFormat;
+using tracing::tracking::SimilarityFromEstimate;
 using tracing::tracking::VisualEstimate;
+using tracing::tracking::VisualParity;
+using tracing::tracking::VisualParityName;
 using tracing::tracking::VisualReject;
 using tracing::tracking::VisualRejectName;
 using tracing::tracking::VisualTrackerOptions;
@@ -147,6 +152,30 @@ void DecomposeExpected(
     radians = std::atan2(c, a);
 }
 
+std::vector<Correspondence> AsymmetricCorrespondences(Transform2D const& transform)
+{
+    std::vector<Vec2> priors{
+        {36.0, 32.0},   {52.0, 32.0},   {84.0, 32.0},   {36.0, 64.0},   {36.0, 96.0},
+        {68.0, 96.0},   {36.0, 140.0},  {36.0, 188.0},  {110.0, 48.0},  {150.0, 70.0},
+        {190.0, 40.0},  {230.0, 88.0},  {270.0, 54.0},  {88.0, 170.0},  {140.0, 150.0},
+        {200.0, 190.0}, {250.0, 160.0}, {280.0, 200.0}, {60.0, 210.0},  {120.0, 120.0},
+        {175.0, 110.0}, {215.0, 130.0}, {95.0, 75.0},   {165.0, 210.0}, {255.0, 115.0},
+    };
+    std::vector<Correspondence> points;
+    points.reserve(priors.size());
+    for (Vec2 const& src : priors)
+    {
+        Vec2 const mapped = MustMap(transform, src);
+        Correspondence item{};
+        item.priorX = src.x;
+        item.priorY = src.y;
+        item.currentX = mapped.x;
+        item.currentY = mapped.y;
+        points.push_back(item);
+    }
+    return points;
+}
+
 std::vector<Correspondence> GridCorrespondences(Transform2D const& transform, int step = 24)
 {
     std::vector<Correspondence> points;
@@ -203,6 +232,68 @@ void ExpectAcceptedNear(
     EXPECT_NEAR(estimate.ty, expectedTy, translationTol);
     EXPECT_NEAR(estimate.uniformScale, expectedScale, scaleTol);
     EXPECT_NEAR(estimate.radiansClockwise, expectedRadians, degreeTol * kPi / 180.0);
+    EXPECT_FALSE(estimate.flipX);
+    EXPECT_FALSE(estimate.flipY);
+    EXPECT_EQ(estimate.parity, VisualParity::None);
+}
+
+Transform2D CenterFlip(bool flipX, bool flipY)
+{
+    Vec2 const center{kWidth * 0.5, kHeight * 0.5};
+    Transform2D const toOrigin = Translate(Space::C, Space::C, -center.x, -center.y);
+    Transform2D const flip = Flip(Space::C, Space::C, flipX, flipY);
+    Transform2D const fromOrigin = Translate(Space::C, Space::C, center.x, center.y);
+    return MustCompose(MustCompose(toOrigin, flip), fromOrigin);
+}
+
+void ExpectMapsNear(
+    char const* label,
+    VisualEstimate const& estimate,
+    Transform2D const& expected,
+    double translationTol)
+{
+    EXPECT_EQ(estimate.reject, VisualReject::Ok) << label << " " << VisualRejectName(estimate.reject);
+    EXPECT_GT(estimate.confidence, 0.0) << label;
+    Transform2D const got = SimilarityFromEstimate(estimate, 1);
+    double maxErr = 0.0;
+    for (int y = 40; y < kHeight - 40; y += 40)
+    {
+        for (int x = 40; x < kWidth - 40; x += 40)
+        {
+            Vec2 const src{static_cast<double>(x), static_cast<double>(y)};
+            Vec2 const want = MustMap(expected, src);
+            Vec2 const have = MustMap(got, src);
+            maxErr = std::max(maxErr, std::hypot(have.x - want.x, have.y - want.y));
+        }
+    }
+    std::cout << label << " reject=" << VisualRejectName(estimate.reject)
+              << " parity=" << VisualParityName(estimate.parity)
+              << " flipX=" << estimate.flipX << " flipY=" << estimate.flipY
+              << " conf=" << estimate.confidence << " maxMapErr=" << maxErr
+              << " rms=" << estimate.rmsResidualPx << "\n";
+    EXPECT_LE(maxErr, translationTol) << label;
+}
+
+cv::Mat MakeLeftRightSymmetricGray()
+{
+    cv::Mat gray(kHeight, kWidth, CV_8UC1);
+    for (int y = 0; y < kHeight; ++y)
+    {
+        for (int x = 0; x < kWidth / 2; ++x)
+        {
+            int const checker = ((x / 12) ^ (y / 16)) & 1;
+            int const value = 40 + checker * 90 + ((x * 13 + y * 7) & 63);
+            auto const pixel = static_cast<std::uint8_t>(std::clamp(value, 0, 255));
+            gray.at<std::uint8_t>(y, x) = pixel;
+            gray.at<std::uint8_t>(y, kWidth - 1 - x) = pixel;
+        }
+    }
+    cv::circle(gray, cv::Point(70, 60), 22, cv::Scalar(240), cv::FILLED);
+    cv::circle(gray, cv::Point(kWidth - 1 - 70, 60), 22, cv::Scalar(240), cv::FILLED);
+    cv::rectangle(gray, cv::Point(40, 150), cv::Point(90, 200), cv::Scalar(20), cv::FILLED);
+    cv::rectangle(
+        gray, cv::Point(kWidth - 1 - 90, 150), cv::Point(kWidth - 1 - 40, 200), cv::Scalar(20), cv::FILLED);
+    return gray;
 }
 
 } // namespace
@@ -211,6 +302,8 @@ TEST(VisualTracker, RejectNameOk)
 {
     EXPECT_STREQ(VisualRejectName(VisualReject::Ok), "ok");
     EXPECT_STREQ(VisualRejectName(VisualReject::ReflectionUnsupported), "reflection-unsupported");
+    EXPECT_STREQ(VisualRejectName(VisualReject::ParityAmbiguous), "parity-ambiguous");
+    EXPECT_STREQ(VisualParityName(VisualParity::FlipX), "x");
 }
 
 TEST(VisualTracker, CorrespondenceTranslation)
@@ -328,20 +421,28 @@ TEST(VisualTracker, CorrespondenceShearRejected)
     EXPECT_EQ(estimate.confidence, 0.0);
 }
 
-TEST(VisualTracker, CorrespondenceHorizontalFlipRejected)
+TEST(VisualTracker, CorrespondenceHorizontalFlipAccepted)
 {
-    Vec2 const center{kWidth * 0.5, kHeight * 0.5};
-    Transform2D const toOrigin = Translate(Space::C, Space::C, -center.x, -center.y);
-    Transform2D const flip = Flip(Space::C, Space::C, true, false);
-    Transform2D const fromOrigin = Translate(Space::C, Space::C, center.x, center.y);
-    Transform2D const transform = MustCompose(MustCompose(toOrigin, flip), fromOrigin);
-    std::vector<Correspondence> const points = GridCorrespondences(transform);
+    Transform2D const transform = CenterFlip(true, false);
+    std::vector<Correspondence> const points = AsymmetricCorrespondences(transform);
     VisualEstimate const estimate =
         EstimateFromCorrespondences(points.data(), points.size(), kWidth, kHeight);
-    EXPECT_EQ(estimate.reject, VisualReject::ReflectionUnsupported)
-        << VisualRejectName(estimate.reject) << " det=" << estimate.affineDet
-        << " scale=" << estimate.uniformScale;
-    EXPECT_EQ(estimate.confidence, 0.0);
+    EXPECT_TRUE(estimate.flipX);
+    EXPECT_FALSE(estimate.flipY);
+    EXPECT_EQ(estimate.parity, VisualParity::FlipX);
+    ExpectMapsNear("corr-flip-x", estimate, transform, 1.5);
+}
+
+TEST(VisualTracker, CorrespondenceVerticalFlipAccepted)
+{
+    Transform2D const transform = CenterFlip(false, true);
+    std::vector<Correspondence> const points = AsymmetricCorrespondences(transform);
+    VisualEstimate const estimate =
+        EstimateFromCorrespondences(points.data(), points.size(), kWidth, kHeight);
+    EXPECT_FALSE(estimate.flipX);
+    EXPECT_TRUE(estimate.flipY);
+    EXPECT_EQ(estimate.parity, VisualParity::FlipY);
+    ExpectMapsNear("corr-flip-y", estimate, transform, 1.5);
 }
 
 TEST(VisualTracker, BlankSceneRejected)
@@ -469,38 +570,117 @@ TEST(VisualTracker, ImageShearRejected)
         << VisualRejectName(estimate.reject);
 }
 
-TEST(VisualTracker, ImageHorizontalFlipNotConfidentRotation)
+TEST(VisualTracker, ImageHorizontalFlipAccepted)
 {
     cv::Mat const prior = MakeTexturedGray(0xF11Fu);
-    Vec2 const center{kWidth * 0.5, kHeight * 0.5};
-    Transform2D const toOrigin = Translate(Space::C, Space::C, -center.x, -center.y);
-    Transform2D const flip = Flip(Space::C, Space::C, true, false);
-    Transform2D const fromOrigin = Translate(Space::C, Space::C, center.x, center.y);
-    Transform2D const transform = MustCompose(MustCompose(toOrigin, flip), fromOrigin);
+    Transform2D const transform = CenterFlip(true, false);
     cv::Mat const current = WarpGray(prior, transform);
     VisualEstimate const estimate = EstimateCanvasMotion(GrayView(prior), GrayView(current));
-    std::cout << "img-flip reject=" << VisualRejectName(estimate.reject)
-              << " conf=" << estimate.confidence << " det=" << estimate.affineDet
-              << " scale=" << estimate.uniformScale
-              << " deg=" << (estimate.radiansClockwise * 180.0 / kPi) << "\n";
-    EXPECT_NE(estimate.reject, VisualReject::Ok) << "partial-affine must not accept a flip";
-    EXPECT_EQ(estimate.confidence, 0.0);
+    EXPECT_TRUE(estimate.flipX);
+    EXPECT_FALSE(estimate.flipY);
+    EXPECT_EQ(estimate.parity, VisualParity::FlipX);
+    ExpectMapsNear("img-flip-x", estimate, transform, 3.0);
 }
 
-TEST(VisualTracker, ImageVerticalFlipNotConfidentRotation)
+TEST(VisualTracker, ImageVerticalFlipAccepted)
 {
     cv::Mat const prior = MakeTexturedGray(0xF11Fu + 3);
-    Vec2 const center{kWidth * 0.5, kHeight * 0.5};
-    Transform2D const toOrigin = Translate(Space::C, Space::C, -center.x, -center.y);
-    Transform2D const flip = Flip(Space::C, Space::C, false, true);
-    Transform2D const fromOrigin = Translate(Space::C, Space::C, center.x, center.y);
-    Transform2D const transform = MustCompose(MustCompose(toOrigin, flip), fromOrigin);
+    Transform2D const transform = CenterFlip(false, true);
     cv::Mat const current = WarpGray(prior, transform);
     VisualEstimate const estimate = EstimateCanvasMotion(GrayView(prior), GrayView(current));
-    std::cout << "img-flip-y reject=" << VisualRejectName(estimate.reject)
-              << " conf=" << estimate.confidence << " det=" << estimate.affineDet << "\n";
+    EXPECT_FALSE(estimate.flipX);
+    EXPECT_TRUE(estimate.flipY);
+    EXPECT_EQ(estimate.parity, VisualParity::FlipY);
+    ExpectMapsNear("img-flip-y", estimate, transform, 3.0);
+}
+
+TEST(VisualTracker, ImageFlipXWithOffCenterRotation)
+{
+    cv::Mat const prior = MakeTexturedGray(0xA0B1u);
+    Transform2D const flipped = CenterFlip(true, false);
+    Transform2D const rotated = RotateAbout(Space::C, Vec2{130.0, 90.0}, 15.0 * kPi / 180.0);
+    Transform2D const transform = MustCompose(flipped, rotated);
+    cv::Mat const current = WarpGray(prior, transform);
+    VisualEstimate const estimate = EstimateCanvasMotion(GrayView(prior), GrayView(current));
+    EXPECT_TRUE(estimate.flipX);
+    EXPECT_FALSE(estimate.flipY);
+    ExpectMapsNear("img-flip-x-rot", estimate, transform, 4.0);
+}
+
+TEST(VisualTracker, ImageFlipYWithTranslation)
+{
+    cv::Mat const prior = MakeTexturedGray(0xC22Du);
+    Transform2D const flipped = CenterFlip(false, true);
+    Transform2D const translated = Translate(Space::C, Space::C, 9.0, -6.0);
+    Transform2D const transform = MustCompose(flipped, translated);
+    cv::Mat const current = WarpGray(prior, transform);
+    VisualEstimate const estimate = EstimateCanvasMotion(GrayView(prior), GrayView(current));
+    EXPECT_FALSE(estimate.flipX);
+    EXPECT_TRUE(estimate.flipY);
+    ExpectMapsNear("img-flip-y-pan", estimate, transform, 3.5);
+}
+
+TEST(VisualTracker, TwoFlipsCanonicalizedTo180Rotation)
+{
+    cv::Mat const prior = MakeTexturedGray(0x1881u);
+    Transform2D const transform = CenterFlip(true, true);
+    cv::Mat const current = WarpGray(prior, transform);
+    VisualEstimate const estimate = EstimateCanvasMotion(GrayView(prior), GrayView(current));
+    EXPECT_FALSE(estimate.flipX);
+    EXPECT_FALSE(estimate.flipY);
+    EXPECT_EQ(estimate.parity, VisualParity::None);
+    ExpectMapsNear("img-two-flips", estimate, transform, 3.5);
+    double const absDeg = std::abs(estimate.radiansClockwise) * 180.0 / kPi;
+    EXPECT_NEAR(absDeg, 180.0, 8.0);
+}
+
+TEST(VisualTracker, SymmetricSceneParityAmbiguous)
+{
+    cv::Mat const prior = MakeLeftRightSymmetricGray();
+    VisualEstimate const estimate = EstimateCanvasMotion(GrayView(prior), GrayView(prior));
+    std::cout << "sym reject=" << VisualRejectName(estimate.reject)
+              << " conf=" << estimate.confidence << " parity=" << VisualParityName(estimate.parity)
+              << "\n";
     EXPECT_NE(estimate.reject, VisualReject::Ok);
     EXPECT_EQ(estimate.confidence, 0.0);
+    EXPECT_TRUE(estimate.reject == VisualReject::ParityAmbiguous ||
+                estimate.reject == VisualReject::ReflectionUnsupported)
+        << VisualRejectName(estimate.reject);
+}
+
+TEST(VisualTracker, ProlongedStrokeOutliersKeepParity)
+{
+    cv::Mat const prior = MakeTexturedGray(0x5700u);
+    Transform2D const transform = Translate(Space::C, Space::C, 8.0, 5.0);
+    cv::Mat current = WarpGray(prior, transform);
+    for (int stroke = 0; stroke < 4; ++stroke)
+    {
+        int const x0 = 18 + stroke * 12;
+        cv::polylines(
+            current,
+            std::vector<std::vector<cv::Point>>{
+                {cv::Point(x0, 24), cv::Point(70 + stroke * 20, 88), cv::Point(36, 170),
+                 cv::Point(110 + stroke * 8, 150), cv::Point(190, 205)}},
+            false, cv::Scalar(255), 12, cv::LINE_8);
+        VisualEstimate const estimate = EstimateCanvasMotion(GrayView(prior), GrayView(current));
+        ExpectAcceptedNear("img-prolonged-stroke", estimate, 8.0, 5.0, 1.0, 0.0, 2.5, 0.05, 1.2);
+        EXPECT_FALSE(estimate.flipX);
+        EXPECT_FALSE(estimate.flipY);
+    }
+}
+
+TEST(VisualTracker, ReturnToKeyframeIsIdentity)
+{
+    cv::Mat const prior = MakeTexturedGray(0x91AAu);
+    Transform2D const warp = Translate(Space::C, Space::C, 10.0, -6.0);
+    cv::Mat const away = WarpGray(prior, warp);
+    VisualEstimate const warped = EstimateCanvasMotion(GrayView(prior), GrayView(away));
+    ExpectAcceptedNear("img-away", warped, 10.0, -6.0, 1.0, 0.0, 2.0, 0.04, 1.0);
+
+    VisualEstimate const back = EstimateCanvasMotion(GrayView(prior), GrayView(prior));
+    ExpectAcceptedNear("img-return-keyframe", back, 0.0, 0.0, 1.0, 0.0, 1.5, 0.04, 1.0);
+    EXPECT_FALSE(back.flipX);
+    EXPECT_FALSE(back.flipY);
 }
 
 TEST(VisualTracker, DegenerateSizeRejected)
