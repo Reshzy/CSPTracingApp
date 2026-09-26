@@ -43,6 +43,7 @@ add_executable(TracingApp WIN32
     src/tracking/TrackingSession.cpp
     src/tracking/TransformFusion.cpp
     src/tracking/NavigatorObserver.cpp
+    src/diagnostics/Metrics.cpp
     resources/app.manifest)
 tracing_app_apply_first_party_options(TracingApp)
 target_link_libraries(TracingApp PRIVATE
@@ -260,6 +261,12 @@ add_executable(TracingApp.FusionTests
 tracing_app_apply_first_party_options(TracingApp.FusionTests)
 target_link_libraries(TracingApp.FusionTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.MetricsTests
+    tests/unit/MetricsTests.cpp
+    src/diagnostics/Metrics.cpp)
+tracing_app_apply_first_party_options(TracingApp.MetricsTests)
+target_link_libraries(TracingApp.MetricsTests PRIVATE GTest::gtest_main)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -281,4 +288,5 @@ add_test(NAME TracingApp.NavigatorTests COMMAND TracingApp.NavigatorTests)
 add_test(NAME TracingApp.InputPredictionTests COMMAND TracingApp.InputPredictionTests)
 add_test(NAME TracingApp.ObserverCapabilityTests COMMAND TracingApp.ObserverCapabilityTests)
 add_test(NAME TracingApp.FusionTests COMMAND TracingApp.FusionTests)
+add_test(NAME TracingApp.MetricsTests COMMAND TracingApp.MetricsTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)

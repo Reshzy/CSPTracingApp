@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <commctrl.h>
+#include <realtimeapiset.h>
 
 #include <climits>
 #include <cmath>
@@ -44,10 +45,11 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "app/ReferenceWindow.h"
 #include "tracking/TrackingSession.h"
 #include "tracking/NavigatorObserver.h"
+#include "diagnostics/Metrics.h"
 
 namespace {
 constexpr int kDefaultWidth = 720;
-constexpr int kDefaultHeight = 1020;
+constexpr int kDefaultHeight = 1048;
 constexpr wchar_t kWindowClass[] = L"TracingAppControlWindow";
 constexpr wchar_t kWindowTitle[] = L"TracingApp";
 constexpr int kIdList = 1001;
@@ -114,6 +116,8 @@ constexpr int kIdApplyPredMapping = 1061;
 constexpr int kIdEnablePred = 1062;
 constexpr int kIdProbeUia = 1063;
 constexpr int kIdHybridFusion = 1064;
+constexpr int kIdObsVerify = 1065;
+constexpr int kIdImageReplay = 1066;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -190,6 +194,19 @@ struct ControlState
     HWND predRotEdit = nullptr;
     HWND predEnableCheck = nullptr;
     HWND hybridFusionCheck = nullptr;
+    HWND obsVerifyCombo = nullptr;
+    HWND imageReplayCheck = nullptr;
+    tracing::diagnostics::MetricsCollector metrics;
+    tracing::diagnostics::ReplayRecorder replay;
+    std::uint64_t lagSequence = 0;
+    std::chrono::steady_clock::time_point lagStart{};
+    bool lagPending = false;
+    std::int64_t lastTrackingLagMs = 0;
+    std::string lastLoggedState;
+    bool lastLoggedAffinity = false;
+    std::uint32_t lastLoggedDeviceHr = 0;
+    std::uint32_t lastLoggedRemovedHr = 0;
+    std::uint64_t lastReplayImageSequence = 0;
     LiveCalibration calibration;
     bool hideOverlayOnCaptureLoss = false;
     bool obsSkipOverlayImagePresent = false;
@@ -569,9 +586,147 @@ void PresentPreview(ControlState& state)
         error);
 }
 
+tracing::diagnostics::ObsVerificationStatus ObsStatusFromCombo(HWND combo) noexcept
+{
+    if (combo == nullptr)
+    {
+        return tracing::diagnostics::ObsVerificationStatus::NotRun;
+    }
+    LRESULT const sel = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    switch (sel)
+    {
+    case 1:
+        return tracing::diagnostics::ObsVerificationStatus::Unverified;
+    case 2:
+        return tracing::diagnostics::ObsVerificationStatus::UserPass;
+    case 3:
+        return tracing::diagnostics::ObsVerificationStatus::UserFail;
+    default:
+        return tracing::diagnostics::ObsVerificationStatus::NotRun;
+    }
+}
+
+void CollectAndRecordMetrics(ControlState& state)
+{
+    tracing::tracking::TransformSnapshot const snap = state.tracking.Snapshot();
+    auto const now = std::chrono::steady_clock::now();
+    if (state.lagPending)
+    {
+        std::int64_t const elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - state.lagStart).count();
+        state.lastTrackingLagMs = elapsed < 0 ? 0 : elapsed;
+        if (state.lagSequence != 0 && snap.sequence >= state.lagSequence)
+        {
+            state.lagPending = false;
+        }
+    }
+
+    tracing::diagnostics::MetricsSample sample{};
+    sample.captureAgeMs = snap.observationAgeMs;
+    tracing::capture::FramePacket const packet = state.capture.LastPacket();
+    ULONGLONG interruptNow = 0;
+    QueryInterruptTime(&interruptNow);
+    if (sample.captureAgeMs <= 0 && packet.sequence != 0 && packet.captureTicks > 0 &&
+        interruptNow != 0)
+    {
+        auto const ticks = static_cast<ULONGLONG>(packet.captureTicks);
+        if (interruptNow >= ticks)
+        {
+            std::int64_t const packetAge =
+                static_cast<std::int64_t>((interruptNow - ticks) / 10000ull);
+            if (packetAge >= 0 && packetAge < 120000)
+            {
+                sample.captureAgeMs = packetAge;
+            }
+        }
+    }
+
+    std::wstring const captureReport = state.capture.FormatReport();
+    tracing::diagnostics::ParseU64Field(captureReport, L"droppedBound=", sample.droppedBound);
+    tracing::diagnostics::ParseU64Field(captureReport, L"mapWaitUs=", sample.stagingWaitUs);
+    sample.trackingLagMs = state.lastTrackingLagMs;
+    sample.confidence = snap.confidence;
+    sample.inliers = snap.inlierCount;
+    sample.residualPx = snap.rmsResidualPx;
+    sample.parity = tracing::tracking::VisualParityName(
+        tracing::tracking::VisualParityFromFlags(snap.flipX, snap.flipY));
+    sample.trackingState = tracing::tracking::FormatTrackingState(snap.state);
+    sample.dpi = state.lastGeometry.dpi;
+    if (state.calibration.roiApplied)
+    {
+        sample.roiW = static_cast<int>(state.calibration.roi.width);
+        sample.roiH = static_cast<int>(state.calibration.roi.height);
+    }
+    sample.deviceHr =
+        static_cast<std::uint32_t>(state.device.Info().lastCreateResult);
+    sample.deviceRemovedHr =
+        static_cast<std::uint32_t>(state.device.Info().lastDeviceRemovedReason);
+    sample.affinityOk = tracing::graphics::AffinityIsReadyForMode(
+        state.overlay.Affinity(), state.overlay.AffinityMode());
+
+    state.metrics.RecordSample(sample);
+    state.metrics.RecordAffinity(sample.affinityOk);
+    state.metrics.SetObsVerification(ObsStatusFromCombo(state.obsVerifyCombo));
+    state.metrics.SetPreviewEnabled(state.preview.IsEnabled());
+
+    bool const replayChecked =
+        state.imageReplayCheck != nullptr &&
+        SendMessageW(state.imageReplayCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (replayChecked)
+    {
+        if (!state.replay.Enabled())
+        {
+            state.replay.SetDirectory("out/replay");
+            state.replay.SetEnabled(true);
+        }
+        state.replay.RecordNumericLine(tracing::diagnostics::FormatMetricsSampleLine(sample));
+        if (state.lastFedRoiSequence != 0 &&
+            state.lastFedRoiSequence != state.lastReplayImageSequence &&
+            state.capture.HasRoiBuffer())
+        {
+            tracing::capture::RoiCpuSnapshot roi = state.capture.LastRoiBuffer();
+            if (roi.valid && !roi.bgra.empty())
+            {
+                state.replay.RecordImageFrame(roi.sequence, roi.bgra.data(), roi.bgra.size());
+                state.lastReplayImageSequence = roi.sequence != 0 ? roi.sequence : state.lastFedRoiSequence;
+            }
+        }
+    }
+    else if (state.replay.Enabled())
+    {
+        state.replay.SetEnabled(false);
+    }
+    state.metrics.NoteReplayStatus(
+        state.replay.Enabled(),
+        state.replay.BytesWritten(),
+        state.replay.MaxBytes(),
+        state.replay.StoppedSizeLimit());
+
+    if (sample.trackingState != state.lastLoggedState ||
+        sample.affinityOk != state.lastLoggedAffinity ||
+        sample.deviceHr != state.lastLoggedDeviceHr ||
+        sample.deviceRemovedHr != state.lastLoggedRemovedHr)
+    {
+        std::string event = "state=";
+        event += sample.trackingState;
+        event += " affinityOk=";
+        event += sample.affinityOk ? "yes" : "no";
+        event += " deviceHr=";
+        event += std::to_string(sample.deviceHr);
+        event += " removedHr=";
+        event += std::to_string(sample.deviceRemovedHr);
+        state.metrics.AppendEvent(event);
+        state.lastLoggedState = sample.trackingState;
+        state.lastLoggedAffinity = sample.affinityOk;
+        state.lastLoggedDeviceHr = sample.deviceHr;
+        state.lastLoggedRemovedHr = sample.deviceRemovedHr;
+    }
+}
+
 std::wstring StatusHeader(ControlState const& state)
 {
-    return ControlDpiLine(state.control) + state.device.FormatReport() + L"\r\n" +
+    return WidenAscii(state.metrics.FormatSummary()) + L"\r\n" +
+           ControlDpiLine(state.control) + state.device.FormatReport() + L"\r\n" +
            state.overlay.FormatReport() + L"\r\n" + state.capture.FormatReport() + L"\r\n" +
            state.preview.FormatReport() + L"\r\n" +
            tracing::graphics::FormatCaptureToClientMapping(MappingFromState(state)) + L"\r\n" +
@@ -663,6 +818,13 @@ void FeedTrackingFromRoi(ControlState& state)
     state.lastFedRoiSequence = snapshot.sequence;
     state.lastRoiFeedValid = true;
     state.lastRoiFeedAction = state.tracking.SubmitRoiFrame(std::move(frame));
+    if (state.lastRoiFeedAction == tracing::tracking::TrackingFrameAction::Enqueue ||
+        state.lastRoiFeedAction == tracing::tracking::TrackingFrameAction::DropOldestThenEnqueue)
+    {
+        state.lagSequence = state.lastFedRoiSequence;
+        state.lagStart = std::chrono::steady_clock::now();
+        state.lagPending = true;
+    }
 }
 
 void FeedNavigatorFromRoi(ControlState& state)
@@ -842,6 +1004,7 @@ void SyncOverlayFromState(ControlState& state)
 
 void SetStatusWithOverlay(ControlState& state, std::wstring const& body)
 {
+    CollectAndRecordMetrics(state);
     SyncPreviewCheckbox(state);
     SyncObsDiagnosticCheckboxes(state);
     SyncOverlayFromState(state);
@@ -1888,6 +2051,38 @@ void OnHybridFusion(ControlState& state)
         L"Hybrid fuse off (default). Overlay follows visual/manual fallback; observers stay status-only.");
 }
 
+void OnObsVerify(ControlState& state)
+{
+    tracing::diagnostics::ObsVerificationStatus const status = ObsStatusFromCombo(state.obsVerifyCombo);
+    state.metrics.SetObsVerification(status);
+    SetStatusWithOverlay(
+        state,
+        L"OBS verification is user-recorded (" +
+            WidenAscii(std::string(tracing::diagnostics::FormatObsVerificationStatus(status))) +
+            L"). Affinity API success is not certification.");
+}
+
+void OnImageReplay(ControlState& state)
+{
+    bool const checked =
+        state.imageReplayCheck != nullptr &&
+        SendMessageW(state.imageReplayCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!checked)
+    {
+        state.replay.SetEnabled(false);
+        SetStatusWithOverlay(
+            state,
+            L"Image replay off (default). Logs omit pixels, full paths, and raw input.");
+        return;
+    }
+    state.replay.SetDirectory("out/replay");
+    state.replay.SetEnabled(true);
+    SetStatusWithOverlay(
+        state,
+        L"Image replay opt-in on: local out/replay with a 32 MiB size cap. "
+        L"Default logs still omit pixels.");
+}
+
 void OnProbeUia(ControlState& state)
 {
     if (!state.accessibility.SessionAttached())
@@ -2254,9 +2449,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            548,
+            576,
             680,
-            406,
+            400,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -2808,6 +3003,54 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             nullptr);
         SendMessageW(created->hybridFusionCheck, BM_SETCHECK, BST_UNCHECKED, 0);
         addButton(L"Probe UIA", 602, 516, 86, 24, kIdProbeUia);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"OBS verify",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            12,
+            548,
+            80,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->obsVerifyCombo = CreateWindowExW(
+            0,
+            L"COMBOBOX",
+            L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+            96,
+            544,
+            200,
+            120,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdObsVerify)),
+            instance,
+            nullptr);
+        if (created->obsVerifyCombo != nullptr)
+        {
+            SendMessageW(created->obsVerifyCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"NOT RUN"));
+            SendMessageW(created->obsVerifyCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"unverified"));
+            SendMessageW(created->obsVerifyCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"user-PASS"));
+            SendMessageW(created->obsVerifyCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"user-FAIL"));
+            SendMessageW(created->obsVerifyCombo, CB_SETCURSEL, 0, 0);
+        }
+        created->imageReplayCheck = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Image replay (opt-in)",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            310,
+            544,
+            220,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdImageReplay)),
+            instance,
+            nullptr);
+        SendMessageW(created->imageReplayCheck, BM_SETCHECK, BST_UNCHECKED, 0);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -2983,6 +3226,16 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdHybridFusion && code == BN_CLICKED)
             {
                 OnHybridFusion(*state);
+                return 0;
+            }
+            if (id == kIdObsVerify && code == CBN_SELCHANGE)
+            {
+                OnObsVerify(*state);
+                return 0;
+            }
+            if (id == kIdImageReplay && code == BN_CLICKED)
+            {
+                OnImageReplay(*state);
                 return 0;
             }
             if (id == kIdProbeUia && code == BN_CLICKED)
