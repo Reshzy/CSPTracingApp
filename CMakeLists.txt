@@ -27,6 +27,7 @@ add_executable(TracingApp WIN32
     src/app/main.cpp
     ${TRACING_APP_PLATFORM_SOURCES}
     src/platform/TargetGeometry.cpp
+    src/platform/InputObserver.cpp
     src/graphics/DeviceResources.cpp
     src/graphics/OverlaySurface.cpp
     src/graphics/CapturePreview.cpp
@@ -231,6 +232,12 @@ target_link_libraries(TracingApp.NavigatorTests PRIVATE
     opencv_core
     opencv_imgproc)
 
+add_executable(TracingApp.InputPredictionTests
+    tests/unit/InputPredictionTests.cpp
+    src/platform/InputObserver.cpp)
+tracing_app_apply_first_party_options(TracingApp.InputPredictionTests)
+target_link_libraries(TracingApp.InputPredictionTests PRIVATE GTest::gtest_main)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -249,4 +256,5 @@ add_test(NAME TracingApp.RoiTests COMMAND TracingApp.RoiTests)
 add_test(NAME TracingApp.VisualTrackerTests COMMAND TracingApp.VisualTrackerTests)
 add_test(NAME TracingApp.TrackingSessionTests COMMAND TracingApp.TrackingSessionTests)
 add_test(NAME TracingApp.NavigatorTests COMMAND TracingApp.NavigatorTests)
+add_test(NAME TracingApp.InputPredictionTests COMMAND TracingApp.InputPredictionTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)

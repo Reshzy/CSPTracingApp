@@ -39,6 +39,7 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "image/ImageLoader.h"
 #include "platform/TargetDiscovery.h"
 #include "platform/TargetGeometry.h"
+#include "platform/InputObserver.h"
 #include "app/ReferenceWindow.h"
 #include "tracking/TrackingSession.h"
 #include "tracking/NavigatorObserver.h"
@@ -105,12 +106,19 @@ constexpr int kIdNavW = 1054;
 constexpr int kIdNavH = 1055;
 constexpr int kIdApplyNavRoi = 1056;
 constexpr int kIdDisableNav = 1057;
+constexpr int kIdPredZoom = 1058;
+constexpr int kIdPredPan = 1059;
+constexpr int kIdPredRot = 1060;
+constexpr int kIdApplyPredMapping = 1061;
+constexpr int kIdEnablePred = 1062;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
 constexpr UINT kMsgStopCapture = WM_APP + 4;
 constexpr UINT_PTR kTimerGeometry = 1;
+constexpr UINT_PTR kTimerInputPred = 2;
 constexpr UINT kGeometryPollMs = 250;
+constexpr UINT kInputPredPollMs = 50;
 constexpr double kAlignNudgePx = 8.0;
 constexpr double kCanvasNudgePx = 16.0;
 constexpr double kScaleStep = 1.05;
@@ -157,6 +165,7 @@ struct ControlState
     tracing::app::ReferenceWindow reference;
     tracing::tracking::TrackingSession tracking;
     tracing::tracking::NavigatorObserver navigator;
+    tracing::platform::InputObserver input;
     HWND previewCheck = nullptr;
     HWND opacityTrack = nullptr;
     HWND obsPositiveControlCheck = nullptr;
@@ -171,6 +180,10 @@ struct ControlState
     HWND navYEdit = nullptr;
     HWND navWEdit = nullptr;
     HWND navHEdit = nullptr;
+    HWND predZoomEdit = nullptr;
+    HWND predPanEdit = nullptr;
+    HWND predRotEdit = nullptr;
+    HWND predEnableCheck = nullptr;
     LiveCalibration calibration;
     bool hideOverlayOnCaptureLoss = false;
     bool obsSkipOverlayImagePresent = false;
@@ -181,6 +194,14 @@ struct ControlState
         tracing::tracking::TrackingFrameAction::RejectNotCalibrated;
     std::uint64_t lastFedNavSequence = 0;
     bool lastNavFeedValid = false;
+    bool rawInputRegistered = false;
+    unsigned long rawInputError = 0;
+    bool visualDeltaHasPrevious = false;
+    std::uint64_t visualDeltaSequence = 0;
+    double visualTx = 0.0;
+    double visualTy = 0.0;
+    double visualScale = 1.0;
+    double visualAngle = 0.0;
 };
 
 std::wstring ControlDpiLine(HWND hwnd)
@@ -341,6 +362,13 @@ void ResetLiveCalibration(ControlState& state)
     state.calibration.zoom = 1.0;
     state.tracking.Detach();
     state.navigator.Disable();
+    state.input.Detach();
+    state.visualDeltaHasPrevious = false;
+    state.visualDeltaSequence = 0;
+    if (state.control != nullptr)
+    {
+        KillTimer(state.control, kTimerInputPred);
+    }
     ResetRoiFeed(state);
     SyncCaptureRoiRequests(state);
 }
@@ -559,7 +587,18 @@ std::wstring StatusHeader(ControlState const& state)
            L"\r\n" +
            WidenAscii(tracing::tracking::FormatNavigatorObservation(state.navigator.Last())) +
            L" navBuffer=" +
-           std::wstring(state.capture.HasNavigatorRoiBuffer() ? L"yes" : L"no") + L"\r\n";
+           std::wstring(state.capture.HasNavigatorRoiBuffer() ? L"yes" : L"no") + L"\r\n" +
+           WidenAscii(tracing::platform::FormatInputObservation(state.input.Last())) +
+           L" predEnabled=" +
+           std::wstring(state.input.Enabled() ? L"yes" : L"no") +
+           L" mapping=" +
+           std::wstring(state.input.MappingApplied() ? L"yes" : L"no") +
+           L" session=" +
+           std::wstring(state.input.SessionAttached() ? L"yes" : L"no") +
+           L" rawInput=" +
+           std::wstring(state.rawInputRegistered ? L"ok" : L"fail") +
+           L" err=" + std::to_wstring(state.rawInputError) +
+           L" (mouse HID observe only; no NOLEGACY; unfused)\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -1019,6 +1058,15 @@ void SelectFromUi(ControlState& state)
     state.selected = selection.identity;
     ++state.nextGeneration;
     ResetLiveCalibration(state);
+    state.input.AttachSession(
+        reinterpret_cast<std::uintptr_t>(state.selected->hwnd),
+        state.selected->process.pid,
+        state.selected->sessionGeneration);
+    if (state.predEnableCheck != nullptr &&
+        SendMessageW(state.predEnableCheck, BM_GETCHECK, 0, 0) == BST_CHECKED)
+    {
+        state.input.Enable();
+    }
 
     std::wstring hookError;
     bool const hooked = StartWatching(state, hookError);
@@ -1552,6 +1600,228 @@ void OnDisableNav(ControlState& state)
         L"Navigator source disabled. Visual/manual tracking is unchanged.");
 }
 
+void SyncInputPredTimer(ControlState& state)
+{
+    if (state.control == nullptr)
+    {
+        return;
+    }
+    if (state.input.Last().pending)
+    {
+        SetTimer(state.control, kTimerInputPred, kInputPredPollMs, nullptr);
+        return;
+    }
+    KillTimer(state.control, kTimerInputPred);
+}
+
+double WrapAngleForInput(double radians) noexcept
+{
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kTwoPi = 2.0 * kPi;
+    while (radians > kPi)
+    {
+        radians -= kTwoPi;
+    }
+    while (radians < -kPi)
+    {
+        radians += kTwoPi;
+    }
+    return radians;
+}
+
+void FeedInputVisualCorrection(ControlState& state)
+{
+    tracing::tracking::TransformSnapshot const snap = state.tracking.Snapshot();
+    std::optional<tracing::core::Vec2> const origin =
+        tracing::core::Apply(snap.mDs, tracing::core::Vec2{});
+    double const scale = std::hypot(snap.mDs.matrix.m[0], snap.mDs.matrix.m[1]);
+    double const angle = std::atan2(snap.mDs.matrix.m[1], snap.mDs.matrix.m[0]);
+    auto const now = std::chrono::steady_clock::now();
+    if (state.input.Last().pending && state.visualDeltaHasPrevious && origin.has_value() &&
+        scale > 1.0e-12 && snap.sequence != 0 && snap.sequence != state.visualDeltaSequence)
+    {
+        tracing::platform::VisualDelta delta{};
+        delta.hasTranslation = true;
+        delta.dx = origin->x - state.visualTx;
+        delta.dy = origin->y - state.visualTy;
+        delta.hasScale = true;
+        delta.logScale = std::log(scale / state.visualScale);
+        delta.hasRotation = true;
+        delta.radiansClockwise = WrapAngleForInput(angle - state.visualAngle);
+        delta.targetGeneration = snap.targetGeneration;
+        state.input.CorrectWithVisual(delta, now);
+    }
+    if (origin.has_value() && scale > 1.0e-12 && snap.sequence != 0)
+    {
+        state.visualDeltaHasPrevious = true;
+        state.visualDeltaSequence = snap.sequence;
+        state.visualTx = origin->x;
+        state.visualTy = origin->y;
+        state.visualScale = scale;
+        state.visualAngle = angle;
+    }
+    state.input.Tick(now);
+    SyncInputPredTimer(state);
+}
+
+void TickInputPrediction(ControlState& state)
+{
+    state.input.Tick(std::chrono::steady_clock::now());
+    FeedInputVisualCorrection(state);
+}
+
+bool RegisterMouseRawInput(HWND hwnd, unsigned long& error)
+{
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02;
+    rid.dwFlags = RIDEV_INPUTSINK;
+    rid.hwndTarget = hwnd;
+    SetLastError(0);
+    if (RegisterRawInputDevices(&rid, 1, sizeof(rid)) != FALSE)
+    {
+        error = 0;
+        return true;
+    }
+    error = GetLastError();
+    return false;
+}
+
+void UnregisterMouseRawInput()
+{
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01;
+    rid.usUsage = 0x02;
+    rid.dwFlags = RIDEV_REMOVE;
+    rid.hwndTarget = nullptr;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
+}
+
+void HandleRawInput(ControlState& state, LPARAM lParam)
+{
+    if (!state.input.Enabled() && !state.input.Last().pending)
+    {
+        return;
+    }
+    UINT size = 0;
+    if (GetRawInputData(
+            reinterpret_cast<HRAWINPUT>(lParam),
+            RID_INPUT,
+            nullptr,
+            &size,
+            sizeof(RAWINPUTHEADER)) != 0 ||
+        size < sizeof(RAWINPUTHEADER))
+    {
+        return;
+    }
+    std::vector<std::uint8_t> buffer(size);
+    UINT copied = size;
+    if (GetRawInputData(
+            reinterpret_cast<HRAWINPUT>(lParam),
+            RID_INPUT,
+            buffer.data(),
+            &copied,
+            sizeof(RAWINPUTHEADER)) == static_cast<UINT>(-1))
+    {
+        return;
+    }
+    auto const* raw = reinterpret_cast<RAWINPUT const*>(buffer.data());
+    if (raw->header.dwType != RIM_TYPEMOUSE)
+    {
+        return;
+    }
+
+    RAWMOUSE const& mouse = raw->data.mouse;
+    tracing::platform::InputSample sample{};
+    sample.deviceKind = tracing::platform::InputDeviceKind::Mouse;
+    sample.foregroundHwnd = reinterpret_cast<std::uintptr_t>(GetForegroundWindow());
+    if (state.selected.has_value())
+    {
+        sample.pid = state.selected->process.pid;
+        sample.targetGeneration = state.selected->sessionGeneration;
+    }
+    sample.shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+    sample.middleButtonDown = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    if ((mouse.usButtonFlags & RI_MOUSE_WHEEL) != 0)
+    {
+        sample.hasWheel = true;
+        short const wheel = static_cast<short>(mouse.usButtonData);
+        sample.wheelNotches = static_cast<int>(wheel) / WHEEL_DELTA;
+    }
+    if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) == 0)
+    {
+        sample.mouseDx = static_cast<double>(mouse.lLastX);
+        sample.mouseDy = static_cast<double>(mouse.lLastY);
+    }
+    state.input.Observe(sample, std::chrono::steady_clock::now());
+    TickInputPrediction(state);
+    SetStatus(state, StatusHeader(state));
+}
+
+void OnApplyPredMapping(ControlState& state)
+{
+    double zoom = 0.0;
+    double pan = 0.0;
+    double rotDeg = 0.0;
+    if (!ReadEditDouble(state.predZoomEdit, zoom, false, 0.0) ||
+        !ReadEditDouble(state.predPanEdit, pan, false, 0.0) ||
+        !ReadEditDouble(state.predRotEdit, rotDeg, false, 0.0))
+    {
+        SetStatusWithOverlay(state, L"Apply mapping: enter numeric zoom/pan/rot deg.");
+        return;
+    }
+
+    tracing::platform::GestureMapping mapping{};
+    mapping.wheel = tracing::platform::MappedAction::Zoom;
+    mapping.wheelShift = tracing::platform::MappedAction::Rotate;
+    mapping.middleDrag = tracing::platform::MappedAction::Pan;
+    mapping.zoomPerWheelNotch = zoom;
+    mapping.panPixelsPerMouseUnit = pan;
+    mapping.radiansPerWheelNotch = rotDeg * std::numbers::pi_v<double> / 180.0;
+    std::string error;
+    if (!state.input.ApplyMapping(mapping, error))
+    {
+        SetStatusWithOverlay(state, L"Apply mapping failed: " + WidenAscii(error));
+        return;
+    }
+    if (state.predEnableCheck != nullptr &&
+        SendMessageW(state.predEnableCheck, BM_GETCHECK, 0, 0) == BST_CHECKED)
+    {
+        state.input.Enable();
+    }
+    SetStatusWithOverlay(
+        state,
+        L"Declared gesture mapping applied (wheel=zoom, Shift+wheel=rotate, middle-drag=pan). "
+        L"Prediction stays off until Enable pred. Input is not fused into overlay this step.");
+}
+
+void OnEnablePred(ControlState& state)
+{
+    bool const checked = state.predEnableCheck != nullptr &&
+                         SendMessageW(state.predEnableCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    if (!checked)
+    {
+        state.input.Disable();
+        SyncInputPredTimer(state);
+        SetStatusWithOverlay(
+            state,
+            L"Input prediction disabled. Mapping kept; overlay/tracking unchanged.");
+        return;
+    }
+    state.input.Enable();
+    if (!state.input.Enabled())
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Enable pred ignored until Apply mapping succeeds. No prediction published.");
+        return;
+    }
+    SetStatusWithOverlay(
+        state,
+        L"Input prediction enabled for the selected foreground session only. "
+        L"Events are observed, not injected; CSP apply is not assumed; overlay is unfused.");
+}
+
 bool HandleCalibrationCommand(ControlState& state, int id)
 {
     auto clampZoom = [](double zoom)
@@ -1875,9 +2145,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            524,
+            548,
             680,
-            430,
+            406,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -2344,6 +2614,89 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             nullptr,
             instance,
             nullptr);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"PRED",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            12,
+            520,
+            40,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"z",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            52,
+            520,
+            12,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->predZoomEdit = addEdit(66, 518, 48, kIdPredZoom, L"1.1");
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"p",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            118,
+            520,
+            12,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->predPanEdit = addEdit(132, 518, 48, kIdPredPan, L"1.0");
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"rdeg",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            184,
+            520,
+            32,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->predRotEdit = addEdit(218, 518, 48, kIdPredRot, L"15");
+        addButton(L"Apply mapping", 270, 516, 118, 24, kIdApplyPredMapping);
+        created->predEnableCheck = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Enable pred",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            392,
+            516,
+            110,
+            24,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdEnablePred)),
+            instance,
+            nullptr);
+        SendMessageW(created->predEnableCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"off until mapping; mouse observe only; not fused",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            508,
+            516,
+            184,
+            24,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -2506,6 +2859,16 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 OnDisableNav(*state);
                 return 0;
             }
+            if (id == kIdApplyPredMapping && code == BN_CLICKED)
+            {
+                OnApplyPredMapping(*state);
+                return 0;
+            }
+            if (id == kIdEnablePred && code == BN_CLICKED)
+            {
+                OnEnablePred(*state);
+                return 0;
+            }
             if (code == BN_CLICKED && HandleCalibrationCommand(*state, id))
             {
                 return 0;
@@ -2550,6 +2913,7 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             state->capture.PumpHandoff();
             FeedTrackingFromRoi(*state);
             FeedNavigatorFromRoi(*state);
+            FeedInputVisualCorrection(*state);
             tracing::capture::FramePacket const packet = state->capture.LastPacket();
             if (packet.stale)
             {
@@ -2575,9 +2939,22 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             return 0;
         }
         break;
+    case WM_INPUT:
+        if (state != nullptr)
+        {
+            HandleRawInput(*state, lParam);
+        }
+        break;
     case WM_TIMER:
+        if (state != nullptr && wParam == kTimerInputPred)
+        {
+            TickInputPrediction(*state);
+            SetStatusWithOverlay(*state, L"");
+            return 0;
+        }
         if (state != nullptr && wParam == kTimerGeometry && state->selected.has_value())
         {
+            TickInputPrediction(*state);
             RefreshGeometryDisplay(*state, L"");
             return 0;
         }
@@ -2591,8 +2968,15 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     case WM_DESTROY:
         if (state != nullptr)
         {
+            if (state->rawInputRegistered)
+            {
+                UnregisterMouseRawInput();
+                state->rawInputRegistered = false;
+            }
+            KillTimer(hwnd, kTimerInputPred);
             StopCapture(*state);
             state->tracking.Stop();
+            state->input.Detach();
             StopWatching(*state);
             state->reference.Release();
             state->preview.Release();
@@ -2654,6 +3038,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     if (window == nullptr)
     {
         return 1;
+    }
+
+    if (auto* created = reinterpret_cast<ControlState*>(GetWindowLongPtrW(window, GWLP_USERDATA)))
+    {
+        created->rawInputRegistered = RegisterMouseRawInput(window, created->rawInputError);
+        std::wstring extra = created->rawInputRegistered
+                                 ? L"Raw Input mouse observe registered (INPUTSINK, no NOLEGACY)."
+                                 : (L"RegisterRawInputDevices failed win32=" +
+                                    std::to_wstring(created->rawInputError) +
+                                    L". Prediction stays observe-only if later registration succeeds.");
+        SetStatusWithOverlay(*created, extra);
     }
 
     ShowWindow(window, showCommand);
