@@ -41,10 +41,11 @@ bool IsValidControlViewport(int width, int height) noexcept
 #include "platform/TargetGeometry.h"
 #include "app/ReferenceWindow.h"
 #include "tracking/TrackingSession.h"
+#include "tracking/NavigatorObserver.h"
 
 namespace {
 constexpr int kDefaultWidth = 720;
-constexpr int kDefaultHeight = 980;
+constexpr int kDefaultHeight = 1020;
 constexpr wchar_t kWindowClass[] = L"TracingAppControlWindow";
 constexpr wchar_t kWindowTitle[] = L"TracingApp";
 constexpr int kIdList = 1001;
@@ -98,6 +99,12 @@ constexpr int kIdCanvasFlipY = 1048;
 constexpr int kIdStartTracking = 1049;
 constexpr int kIdPauseTracking = 1050;
 constexpr int kIdResyncTracking = 1051;
+constexpr int kIdNavX = 1052;
+constexpr int kIdNavY = 1053;
+constexpr int kIdNavW = 1054;
+constexpr int kIdNavH = 1055;
+constexpr int kIdApplyNavRoi = 1056;
+constexpr int kIdDisableNav = 1057;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -149,6 +156,7 @@ struct ControlState
     tracing::graphics::ImageRenderer renderer;
     tracing::app::ReferenceWindow reference;
     tracing::tracking::TrackingSession tracking;
+    tracing::tracking::NavigatorObserver navigator;
     HWND previewCheck = nullptr;
     HWND opacityTrack = nullptr;
     HWND obsPositiveControlCheck = nullptr;
@@ -159,6 +167,10 @@ struct ControlState
     HWND roiHEdit = nullptr;
     HWND docWEdit = nullptr;
     HWND docHEdit = nullptr;
+    HWND navXEdit = nullptr;
+    HWND navYEdit = nullptr;
+    HWND navWEdit = nullptr;
+    HWND navHEdit = nullptr;
     LiveCalibration calibration;
     bool hideOverlayOnCaptureLoss = false;
     bool obsSkipOverlayImagePresent = false;
@@ -299,6 +311,7 @@ void ResetLiveCalibration(ControlState& state)
     state.calibration.mRd = tracing::core::ResetReferenceAlignment();
     state.calibration.zoom = 1.0;
     state.tracking.Detach();
+    state.navigator.Disable();
     ResetRoiFeed(state);
     SyncCanvasRoiRequest(state);
 }
@@ -446,6 +459,7 @@ void RefreshCalibrationValidity(ControlState& state)
         state.calibration.roiApplied = false;
         state.calibration.lastInvalidation = reason;
         state.tracking.Detach();
+        state.navigator.Disable();
         ResetRoiFeed(state);
     }
 }
@@ -513,7 +527,9 @@ std::wstring StatusHeader(ControlState const& state)
            std::to_wstring(state.lastFedRoiSequence) + L" valid=" +
            std::wstring(state.lastRoiFeedValid ? L"yes" : L"no") + L" action=" +
            WidenAscii(tracing::tracking::FormatTrackingFrameAction(state.lastRoiFeedAction)) +
-           L"\r\n";
+           L"\r\n" +
+           WidenAscii(tracing::tracking::FormatNavigatorObservation(state.navigator.Last())) +
+           L" navBuffer=no (no WGC navigator buffer; 20b)\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -1376,6 +1392,81 @@ void OnApplyRoi(ControlState& state)
         L"Window move updates M_SO only. Start tracking after alignment.");
 }
 
+void OnApplyNavRoi(ControlState& state)
+{
+    if (!state.selected.has_value())
+    {
+        SetStatusWithOverlay(state, L"Apply Nav ROI: select a PAINT HWND first.");
+        return;
+    }
+    if (state.lastGeometry.clientPhysical.width <= 0 ||
+        state.lastGeometry.clientPhysical.height <= 0)
+    {
+        SetStatusWithOverlay(state, L"Apply Nav ROI: target client geometry is not valid yet.");
+        return;
+    }
+
+    tracing::core::Rect2 roi{};
+    if (!ReadEditDouble(state.navXEdit, roi.x, false, 0.0) ||
+        !ReadEditDouble(state.navYEdit, roi.y, false, 0.0) ||
+        !ReadEditDouble(state.navWEdit, roi.width, false, 0.0) ||
+        !ReadEditDouble(state.navHEdit, roi.height, false, 0.0))
+    {
+        SetStatusWithOverlay(state, L"Apply Nav ROI: enter numeric client-relative x y w h.");
+        return;
+    }
+
+    double declaredW = 0.0;
+    double declaredH = 0.0;
+    if (!ReadEditDouble(state.docWEdit, declaredW, true, 0.0) ||
+        !ReadEditDouble(state.docHEdit, declaredH, true, 0.0))
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Apply Nav ROI: document W/H must be empty or numeric (optional mapping).");
+        return;
+    }
+
+    tracing::core::RoiRejectReason reason = tracing::core::RoiRejectReason::Ok;
+    if (!state.navigator.SetRoi(
+            roi,
+            static_cast<double>(state.lastGeometry.clientPhysical.width),
+            static_cast<double>(state.lastGeometry.clientPhysical.height),
+            reason))
+    {
+        SetStatusWithOverlay(
+            state,
+            std::wstring(L"Apply Nav ROI rejected: ") +
+                WidenAscii(tracing::core::FormatRoiRejectReason(reason)) +
+                L" (Navigator ROI is client-relative; canvas tracking is unchanged).");
+        return;
+    }
+
+    if (declaredW > 0.0 && declaredH > 0.0)
+    {
+        state.navigator.SetMapping(declaredW, declaredH);
+    }
+    else
+    {
+        state.navigator.ClearMapping();
+    }
+
+    tracing::tracking::NavigatorView empty{};
+    state.navigator.Observe(empty);
+    SetStatusWithOverlay(
+        state,
+        L"Applied Navigator ROI. Source is missing until a WGC navigator buffer exists (20b). "
+        L"Canvas tracking and manual M_RD/M_DS are unchanged.");
+}
+
+void OnDisableNav(ControlState& state)
+{
+    state.navigator.Disable();
+    SetStatusWithOverlay(
+        state,
+        L"Navigator source disabled. Visual/manual tracking is unchanged.");
+}
+
 bool HandleCalibrationCommand(ControlState& state, int id)
 {
     auto clampZoom = [](double zoom)
@@ -1698,9 +1789,9 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
             12,
-            492,
+            524,
             680,
-            420,
+            430,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdStatus)),
             instance,
@@ -2135,6 +2226,38 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             nullptr,
             instance,
             nullptr);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"NAV",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            12,
+            494,
+            36,
+            20,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
+        created->navXEdit = addEdit(48, 492, 50, kIdNavX, L"12");
+        created->navYEdit = addEdit(100, 492, 50, kIdNavY, L"12");
+        created->navWEdit = addEdit(152, 492, 50, kIdNavW, L"160");
+        created->navHEdit = addEdit(204, 492, 50, kIdNavH, L"120");
+        addButton(L"Apply Nav ROI", 258, 490, 118, 24, kIdApplyNavRoi);
+        addButton(L"Disable Nav", 380, 490, 100, 24, kIdDisableNav);
+        CreateWindowExW(
+            0,
+            L"STATIC",
+            L"optional Doc px mapping; missing Nav does not pause tracking",
+            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
+            488,
+            490,
+            200,
+            28,
+            hwnd,
+            nullptr,
+            instance,
+            nullptr);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -2285,6 +2408,16 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdResyncTracking && code == BN_CLICKED)
             {
                 OnResyncTracking(*state);
+                return 0;
+            }
+            if (id == kIdApplyNavRoi && code == BN_CLICKED)
+            {
+                OnApplyNavRoi(*state);
+                return 0;
+            }
+            if (id == kIdDisableNav && code == BN_CLICKED)
+            {
+                OnDisableNav(*state);
                 return 0;
             }
             if (code == BN_CLICKED && HandleCalibrationCommand(*state, id))
