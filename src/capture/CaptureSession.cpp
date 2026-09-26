@@ -82,6 +82,22 @@ Microsoft::WRL::ComPtr<ID3D11Texture2D> TextureFromSurface(wgd3d::IDirect3DSurfa
     return texture;
 }
 
+RoiCpuSnapshot PackRoiSnapshot(RoiCpuBuffer const& packed)
+{
+    RoiCpuSnapshot snapshot{};
+    snapshot.sequence = packed.meta.sequence;
+    snapshot.captureTicks = packed.meta.captureTicks;
+    snapshot.targetGeneration = packed.meta.targetGeneration;
+    snapshot.geometryGeneration = packed.meta.geometryGeneration;
+    snapshot.width = packed.width;
+    snapshot.height = packed.height;
+    snapshot.stride = packed.stride;
+    snapshot.downsample = packed.downsample;
+    snapshot.bgra = packed.bgra;
+    snapshot.valid = packed.width > 0 && packed.height > 0 && !packed.bgra.empty();
+    return snapshot;
+}
+
 } // namespace
 
 struct CaptureSession::Impl
@@ -123,11 +139,17 @@ struct CaptureSession::Impl
     std::uint64_t recreateCount = 0;
     HRESULT lastRecreateHr = S_OK;
     RoiReadback roiReadback;
+    RoiReadback navigatorReadback;
     std::wstring roiReport{L"roi (none)"};
     std::wstring roiSrc{L"full-content-fallback"};
+    std::wstring navigatorRoiReport{L"navRoi (none)"};
+    std::wstring navigatorRoiSrc{L"none"};
     CanvasRoiRequest canvasRoi{};
+    NavigatorRoiRequest navigatorRoi{};
     RoiCpuSnapshot lastRoiBuffer{};
+    RoiCpuSnapshot lastNavigatorRoiBuffer{};
     bool hasRoiBuffer = false;
+    bool hasNavigatorRoiBuffer = false;
 
     void OnFrameArrived(wgc::Direct3D11CaptureFramePool const& sender, winrt::Windows::Foundation::IInspectable const&);
     void OnClosed(wgc::GraphicsCaptureItem const&, winrt::Windows::Foundation::IInspectable const&);
@@ -221,7 +243,9 @@ void CaptureSession::Impl::TeardownResources() noexcept
         device = nullptr;
         hasOwnedFrame = false;
         hasRoiBuffer = false;
+        hasNavigatorRoiBuffer = false;
         lastRoiBuffer = {};
+        lastNavigatorRoiBuffer = {};
     }
     for (auto& queued : local)
     {
@@ -229,9 +253,13 @@ void CaptureSession::Impl::TeardownResources() noexcept
     }
 
     roiReadback.Release();
+    navigatorReadback.Release();
     roiReport = L"roi (none)";
     roiSrc = L"full-content-fallback";
+    navigatorRoiReport = L"navRoi (none)";
+    navigatorRoiSrc = L"none";
     canvasRoi = {};
+    navigatorRoi = {};
 
     ownedTexture.Reset();
     ownedWidth = 0;
@@ -726,14 +754,23 @@ void CaptureSession::PumpHandoff()
     std::wstring roiError;
     std::wstring lastRoiSrc;
     bool haveRoiSrc = false;
+    std::wstring lastNavRoiSrc = L"none";
+    bool haveNavRoiSrc = false;
+    bool navigatorCopyFailed = false;
+    bool navigatorApplied = false;
+    bool evaluatedNavigator = false;
+    RoiCpuSnapshot navigatorSnapshot{};
+    bool haveNavigatorSnapshot = false;
     if (copied && impl_->ownedTexture)
     {
         graphics::DeviceResources* gpu = nullptr;
         CanvasRoiRequest roiRequest{};
+        NavigatorRoiRequest navigatorRequest{};
         {
             std::lock_guard<std::mutex> const lock(impl_->mutex);
             gpu = impl_->device;
             roiRequest = impl_->canvasRoi;
+            navigatorRequest = impl_->navigatorRoi;
         }
         if (gpu != nullptr && gpu->IsReady() && gpu->Device() != nullptr &&
             gpu->ImmediateContext() != nullptr)
@@ -773,6 +810,47 @@ void CaptureSession::PumpHandoff()
             impl_->roiReadback.TryComplete(gpu->ImmediateContext(), roiError);
             lastRoiSrc = std::move(roiSrc);
             haveRoiSrc = true;
+
+            evaluatedNavigator = true;
+            navigatorApplied = navigatorRequest.applied && navigatorRequest.mappingValidated &&
+                               navigatorRequest.captureW > 0 && navigatorRequest.captureH > 0;
+            if (navigatorApplied)
+            {
+                lastNavRoiSrc = L"applied-mapped";
+                haveNavRoiSrc = true;
+                RoiPixelRect navRequested{};
+                navRequested.x = navigatorRequest.captureX;
+                navRequested.y = navigatorRequest.captureY;
+                navRequested.w = navigatorRequest.captureW;
+                navRequested.h = navigatorRequest.captureH;
+                int const navDownsample = DefaultRoiDownsample(navRequested.w, navRequested.h);
+                RoiBufferMeta navMeta = meta;
+                navMeta.kind = RoiKind::Navigator;
+                std::wstring navError;
+                bool const submitted = impl_->navigatorReadback.SubmitCopy(
+                    gpu->Device(),
+                    gpu->ImmediateContext(),
+                    impl_->ownedTexture.Get(),
+                    RoiKind::Navigator,
+                    navRequested,
+                    navDownsample,
+                    navMeta,
+                    navError);
+                impl_->navigatorReadback.TryComplete(gpu->ImmediateContext(), navError);
+                if (!submitted)
+                {
+                    navigatorCopyFailed = true;
+                }
+                else if (impl_->navigatorReadback.HasBuffer())
+                {
+                    navigatorSnapshot = PackRoiSnapshot(impl_->navigatorReadback.LastBuffer());
+                    haveNavigatorSnapshot = navigatorSnapshot.valid;
+                }
+            }
+            else
+            {
+                haveNavRoiSrc = true;
+            }
         }
     }
 
@@ -789,26 +867,29 @@ void CaptureSession::PumpHandoff()
         impl_->lastHr = copied ? recreateHr : copyHr;
         impl_->lastRecreateHr = recreateHr;
         impl_->roiReport = impl_->roiReadback.FormatReport();
+        impl_->navigatorRoiReport = impl_->navigatorReadback.FormatReport();
         if (haveRoiSrc)
         {
             impl_->roiSrc = std::move(lastRoiSrc);
         }
+        if (haveNavRoiSrc)
+        {
+            impl_->navigatorRoiSrc = std::move(lastNavRoiSrc);
+        }
         if (impl_->roiReadback.HasBuffer())
         {
-            RoiCpuBuffer const& packed = impl_->roiReadback.LastBuffer();
-            RoiCpuSnapshot snapshot{};
-            snapshot.sequence = packed.meta.sequence;
-            snapshot.captureTicks = packed.meta.captureTicks;
-            snapshot.targetGeneration = packed.meta.targetGeneration;
-            snapshot.geometryGeneration = packed.meta.geometryGeneration;
-            snapshot.width = packed.width;
-            snapshot.height = packed.height;
-            snapshot.stride = packed.stride;
-            snapshot.downsample = packed.downsample;
-            snapshot.bgra = packed.bgra;
-            snapshot.valid = packed.width > 0 && packed.height > 0 && !packed.bgra.empty();
-            impl_->lastRoiBuffer = std::move(snapshot);
+            impl_->lastRoiBuffer = PackRoiSnapshot(impl_->roiReadback.LastBuffer());
             impl_->hasRoiBuffer = impl_->lastRoiBuffer.valid;
+        }
+        if (haveNavigatorSnapshot)
+        {
+            impl_->lastNavigatorRoiBuffer = std::move(navigatorSnapshot);
+            impl_->hasNavigatorRoiBuffer = impl_->lastNavigatorRoiBuffer.valid;
+        }
+        else if (evaluatedNavigator && (!navigatorApplied || navigatorCopyFailed))
+        {
+            impl_->lastNavigatorRoiBuffer = {};
+            impl_->hasNavigatorRoiBuffer = false;
         }
         if (copied)
         {
@@ -877,6 +958,26 @@ RoiCpuSnapshot CaptureSession::LastRoiBuffer() const
     return impl_->lastRoiBuffer;
 }
 
+bool CaptureSession::HasNavigatorRoiBuffer() const noexcept
+{
+    if (!impl_)
+    {
+        return false;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->hasNavigatorRoiBuffer;
+}
+
+RoiCpuSnapshot CaptureSession::LastNavigatorRoiBuffer() const
+{
+    if (!impl_)
+    {
+        return {};
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    return impl_->lastNavigatorRoiBuffer;
+}
+
 void CaptureSession::NoteGeometryGeneration(std::uint64_t geometryGeneration) noexcept
 {
     if (!impl_)
@@ -895,6 +996,16 @@ void CaptureSession::SetCanvasRoiRequest(CanvasRoiRequest const& request) noexce
     }
     std::lock_guard<std::mutex> const lock(impl_->mutex);
     impl_->canvasRoi = request;
+}
+
+void CaptureSession::SetNavigatorRoiRequest(NavigatorRoiRequest const& request) noexcept
+{
+    if (!impl_)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> const lock(impl_->mutex);
+    impl_->navigatorRoi = request;
 }
 
 ID3D11Texture2D* CaptureSession::BorrowOwnedTexture() const noexcept
@@ -929,6 +1040,8 @@ std::wstring CaptureSession::FormatReport() const
     HRESULT lastRecreateHr = S_OK;
     std::wstring roiReport;
     std::wstring roiSrc;
+    std::wstring navigatorRoiReport;
+    std::wstring navigatorRoiSrc;
     {
         std::lock_guard<std::mutex> const lock(impl_->mutex);
         policySnapshot = impl_->policy;
@@ -946,6 +1059,8 @@ std::wstring CaptureSession::FormatReport() const
         lastRecreateHr = impl_->lastRecreateHr;
         roiReport = impl_->roiReport;
         roiSrc = impl_->roiSrc;
+        navigatorRoiReport = impl_->navigatorRoiReport;
+        navigatorRoiSrc = impl_->navigatorRoiSrc;
     }
 
     std::wstring supportText = L"unchecked";
@@ -970,7 +1085,8 @@ std::wstring CaptureSession::FormatReport() const
            L" ownedFrame=" + (hasOwned ? L"yes" : L"no") + L" lastHr=" + FormatHresult(lastHr) +
            L"\r\n" + L"poolSize=" + std::to_wstring(poolWidth) + L"x" + std::to_wstring(poolHeight) +
            L" recreates=" + std::to_wstring(recreateCount) + L" recreateHr=" +
-           FormatHresult(lastRecreateHr) + L"\r\n" + roiReport + L" roiSrc=" + roiSrc +
+           FormatHresult(lastRecreateHr) + L"\r\n" + roiReport + L" roiSrc=" + roiSrc + L"\r\n" +
+           navigatorRoiReport + L" navRoiSrc=" + navigatorRoiSrc +
            L" (WGC copies owned textures; ROI CPU buffer is a packed copy, not zero-copy)";
 }
 

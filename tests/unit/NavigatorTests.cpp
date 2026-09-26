@@ -83,6 +83,49 @@ NavigatorView GrayView(
     return view;
 }
 
+std::vector<std::uint8_t> GrayToPackedBgra(cv::Mat const& gray)
+{
+    std::vector<std::uint8_t> bgra(static_cast<std::size_t>(gray.cols) * static_cast<std::size_t>(gray.rows) * 4u);
+    for (int y = 0; y < gray.rows; ++y)
+    {
+        std::uint8_t const* row = gray.ptr<std::uint8_t>(y);
+        for (int x = 0; x < gray.cols; ++x)
+        {
+            std::size_t const i =
+                (static_cast<std::size_t>(y) * static_cast<std::size_t>(gray.cols) + static_cast<std::size_t>(x)) *
+                4u;
+            std::uint8_t const value = row[x];
+            bgra[i + 0] = value;
+            bgra[i + 1] = value;
+            bgra[i + 2] = value;
+            bgra[i + 3] = 255;
+        }
+    }
+    return bgra;
+}
+
+NavigatorView PackedBgraView(
+    std::vector<std::uint8_t> const& bgra,
+    int width,
+    int height,
+    std::uint64_t sequence,
+    std::int64_t ticks,
+    std::uint64_t targetGeneration,
+    std::uint64_t geometryGeneration)
+{
+    NavigatorView view{};
+    view.data = bgra.data();
+    view.width = width;
+    view.height = height;
+    view.stride = width * 4;
+    view.format = NavigatorPixelFormat::Bgra32;
+    view.sequence = sequence;
+    view.captureTicks = ticks;
+    view.targetGeneration = targetGeneration;
+    view.geometryGeneration = geometryGeneration;
+    return view;
+}
+
 bool ApplyDefaultRoi(NavigatorObserver& observer)
 {
     RoiRejectReason reason = RoiRejectReason::Ok;
@@ -329,6 +372,72 @@ TEST(NavigatorObserver, FormatNamesAreStable)
     EXPECT_STREQ(FormatNavigatorSource(NavigatorSource::Missing), "missing");
     EXPECT_STREQ(FormatNavigatorReject(NavigatorReject::NoRoi), "no-roi");
     EXPECT_STREQ(FormatNavigatorReject(NavigatorReject::BlankOrNoIndicator), "blank-or-no-indicator");
+}
+
+TEST(NavigatorObserver, PackedBgraObserveCopiesMetadataWithoutZoomPercent)
+{
+    NavigatorObserver observer;
+    ASSERT_TRUE(ApplyDefaultRoi(observer));
+
+    cv::Mat gray = MakeTexturedGray(0xB0B0u);
+    FillRotatedRect(gray, cv::Point2f(72.f, 58.f), cv::Size2f(52.f, 30.f), 0.f, 18);
+    std::vector<std::uint8_t> const packed = GrayToPackedBgra(gray);
+    NavigatorObservation const observation = observer.Observe(
+        PackedBgraView(packed, kWidth, kHeight, 84, 8400, 21, 13));
+
+    ASSERT_EQ(observation.source, NavigatorSource::Observed) << FormatNavigatorObservation(observation);
+    EXPECT_EQ(observation.sequence, 84u);
+    EXPECT_EQ(observation.captureTicks, 8400);
+    EXPECT_EQ(observation.targetGeneration, 21u);
+    EXPECT_EQ(observation.geometryGeneration, 13u);
+    EXPECT_TRUE(observation.hasTranslation);
+    EXPECT_TRUE(observation.hasRelativeScale);
+    EXPECT_FALSE(observation.hasParity);
+    EXPECT_FALSE(observation.hasZoomPercent);
+    EXPECT_NEAR(observation.centerU, 72.0 / kWidth, 0.08);
+}
+
+TEST(NavigatorObserver, PackedBgraEmptyViewIsMissingWithoutDocumentCoords)
+{
+    NavigatorObserver observer;
+    ASSERT_TRUE(ApplyDefaultRoi(observer));
+    observer.SetMapping(1000.0, 800.0);
+
+    NavigatorView empty{};
+    empty.format = NavigatorPixelFormat::Bgra32;
+    empty.sequence = 85;
+    empty.captureTicks = 8500;
+    empty.targetGeneration = 22;
+    empty.geometryGeneration = 14;
+    NavigatorObservation const observation = observer.Observe(empty);
+
+    EXPECT_EQ(observation.source, NavigatorSource::Missing);
+    EXPECT_EQ(observation.reject, NavigatorReject::DegenerateSize);
+    EXPECT_EQ(observation.sequence, 85u);
+    EXPECT_FALSE(observation.hasTranslation);
+    EXPECT_FALSE(observation.hasDocumentPosition);
+    EXPECT_FALSE(observation.hasZoomPercent);
+}
+
+TEST(NavigatorObserver, DisableIgnoresPackedBgra)
+{
+    NavigatorObserver observer;
+    ASSERT_TRUE(ApplyDefaultRoi(observer));
+    observer.Disable();
+
+    cv::Mat gray = MakeTexturedGray(0xA1A1u);
+    FillRotatedRect(gray, cv::Point2f(80.f, 60.f), cv::Size2f(50.f, 30.f), 0.f, 18);
+    std::vector<std::uint8_t> const packed = GrayToPackedBgra(gray);
+    NavigatorObservation const observation = observer.Observe(
+        PackedBgraView(packed, kWidth, kHeight, 86, 8600, 23, 15));
+
+    EXPECT_EQ(observation.source, NavigatorSource::Disabled);
+    EXPECT_EQ(observation.reject, NavigatorReject::Disabled);
+    EXPECT_FALSE(observation.hasTranslation);
+    EXPECT_FALSE(observation.hasDocumentPosition);
+    EXPECT_FALSE(observation.hasZoomPercent);
+    EXPECT_EQ(observation.sequence, 86u);
+    EXPECT_FALSE(observer.Enabled());
 }
 
 TEST(NavigatorObserver, RealCspFixtureIsLocalOptIn)

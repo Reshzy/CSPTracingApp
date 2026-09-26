@@ -179,6 +179,8 @@ struct ControlState
     bool lastRoiFeedValid = false;
     tracing::tracking::TrackingFrameAction lastRoiFeedAction =
         tracing::tracking::TrackingFrameAction::RejectNotCalibrated;
+    std::uint64_t lastFedNavSequence = 0;
+    bool lastNavFeedValid = false;
 };
 
 std::wstring ControlDpiLine(HWND hwnd)
@@ -256,7 +258,8 @@ bool CalibrationIsLive(ControlState const& state) noexcept
            state.calibration.lastInvalidation == tracing::core::CalibrationInvalidation::None;
 }
 
-bool TryRoundCaptureRoi(tracing::core::Rect2 const& roi, tracing::capture::CanvasRoiRequest& request)
+template <typename RoiRequest>
+bool TryRoundCaptureRoi(tracing::core::Rect2 const& roi, RoiRequest& request)
 {
     if (!std::isfinite(roi.x) || !std::isfinite(roi.y) || !std::isfinite(roi.width) ||
         !std::isfinite(roi.height))
@@ -298,11 +301,37 @@ void SyncCanvasRoiRequest(ControlState& state)
     state.capture.SetCanvasRoiRequest(request);
 }
 
+void SyncNavigatorRoiRequest(ControlState& state)
+{
+    tracing::capture::NavigatorRoiRequest request{};
+    tracing::core::CaptureMappingInput const mapping = CoreMappingFromState(state);
+    if (state.navigator.Enabled() && state.navigator.RoiApplied() &&
+        tracing::core::CaptureMappingIsValidated(mapping))
+    {
+        std::optional<tracing::core::Rect2> const captureRoi =
+            tracing::core::TryMapClientRoiToCapture(mapping, state.navigator.Roi());
+        if (captureRoi.has_value() && TryRoundCaptureRoi(*captureRoi, request))
+        {
+            request.applied = true;
+            request.mappingValidated = true;
+        }
+    }
+    state.capture.SetNavigatorRoiRequest(request);
+}
+
+void SyncCaptureRoiRequests(ControlState& state)
+{
+    SyncCanvasRoiRequest(state);
+    SyncNavigatorRoiRequest(state);
+}
+
 void ResetRoiFeed(ControlState& state) noexcept
 {
     state.lastFedRoiSequence = 0;
     state.lastRoiFeedValid = false;
     state.lastRoiFeedAction = tracing::tracking::TrackingFrameAction::RejectNotCalibrated;
+    state.lastFedNavSequence = 0;
+    state.lastNavFeedValid = false;
 }
 
 void ResetLiveCalibration(ControlState& state)
@@ -313,7 +342,7 @@ void ResetLiveCalibration(ControlState& state)
     state.tracking.Detach();
     state.navigator.Disable();
     ResetRoiFeed(state);
-    SyncCanvasRoiRequest(state);
+    SyncCaptureRoiRequests(state);
 }
 
 bool ReadEditDouble(HWND edit, double& value, bool allowEmpty, double emptyValue)
@@ -529,7 +558,8 @@ std::wstring StatusHeader(ControlState const& state)
            WidenAscii(tracing::tracking::FormatTrackingFrameAction(state.lastRoiFeedAction)) +
            L"\r\n" +
            WidenAscii(tracing::tracking::FormatNavigatorObservation(state.navigator.Last())) +
-           L" navBuffer=no (no WGC navigator buffer; 20b)\r\n";
+           L" navBuffer=" +
+           std::wstring(state.capture.HasNavigatorRoiBuffer() ? L"yes" : L"no") + L"\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -581,12 +611,61 @@ void FeedTrackingFromRoi(ControlState& state)
     state.lastRoiFeedAction = state.tracking.SubmitRoiFrame(std::move(frame));
 }
 
+void FeedNavigatorFromRoi(ControlState& state)
+{
+    if (!state.navigator.Enabled())
+    {
+        return;
+    }
+
+    if (!state.capture.HasNavigatorRoiBuffer())
+    {
+        if (state.lastNavFeedValid || state.lastFedNavSequence != 0)
+        {
+            tracing::tracking::NavigatorView empty{};
+            state.navigator.Observe(empty);
+            state.lastNavFeedValid = false;
+            state.lastFedNavSequence = 0;
+        }
+        return;
+    }
+
+    tracing::capture::RoiCpuSnapshot snapshot = state.capture.LastNavigatorRoiBuffer();
+    if (!snapshot.valid || snapshot.sequence == 0 || snapshot.bgra.empty() || snapshot.width <= 0 ||
+        snapshot.height <= 0)
+    {
+        tracing::tracking::NavigatorView empty{};
+        state.navigator.Observe(empty);
+        state.lastNavFeedValid = false;
+        state.lastFedNavSequence = 0;
+        return;
+    }
+    if (state.lastNavFeedValid && snapshot.sequence == state.lastFedNavSequence)
+    {
+        return;
+    }
+
+    tracing::tracking::NavigatorView view{};
+    view.data = snapshot.bgra.data();
+    view.width = snapshot.width;
+    view.height = snapshot.height;
+    view.stride = snapshot.stride;
+    view.format = tracing::tracking::NavigatorPixelFormat::Bgra32;
+    view.captureTicks = snapshot.captureTicks;
+    view.sequence = snapshot.sequence;
+    view.targetGeneration = snapshot.targetGeneration;
+    view.geometryGeneration = snapshot.geometryGeneration;
+    state.navigator.Observe(view);
+    state.lastFedNavSequence = snapshot.sequence;
+    state.lastNavFeedValid = true;
+}
+
 void StopCapture(ControlState& state)
 {
     state.capture.Stop();
     state.tracking.Detach();
     ResetRoiFeed(state);
-    SyncCanvasRoiRequest(state);
+    SyncCaptureRoiRequests(state);
     if (state.preview.IsEnabled())
     {
         std::wstring error;
@@ -764,7 +843,7 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
     state.lastGeometry = sampled;
     RefreshCalibrationValidity(state);
     state.capture.NoteGeometryGeneration(sampled.geometryGeneration);
-    SyncCanvasRoiRequest(state);
+    SyncCaptureRoiRequests(state);
     if (CalibrationIsLive(state))
     {
         tracing::core::Vec2 const overlayOrigin = tracing::core::RoiScreenOrigin(
@@ -1385,7 +1464,7 @@ void OnApplyRoi(ControlState& state)
     state.calibration.lastInvalidation = tracing::core::CalibrationInvalidation::None;
     ++state.calibration.calibrationGeneration;
     ApplyDerivedImagePlacement(state);
-    SyncCanvasRoiRequest(state);
+    SyncCaptureRoiRequests(state);
     SetStatusWithOverlay(
         state,
         L"Applied canvas ROI in client-relative pixels. Overlay HWND clipped to ROI. "
@@ -1453,15 +1532,21 @@ void OnApplyNavRoi(ControlState& state)
 
     tracing::tracking::NavigatorView empty{};
     state.navigator.Observe(empty);
+    state.lastFedNavSequence = 0;
+    state.lastNavFeedValid = false;
+    SyncNavigatorRoiRequest(state);
     SetStatusWithOverlay(
         state,
-        L"Applied Navigator ROI. Source is missing until a WGC navigator buffer exists (20b). "
-        L"Canvas tracking and manual M_RD/M_DS are unchanged.");
+        L"Applied Navigator ROI. Waiting for a packed WGC navigator buffer (no full-content "
+        L"fallback). Canvas tracking and manual M_RD/M_DS are unchanged.");
 }
 
 void OnDisableNav(ControlState& state)
 {
     state.navigator.Disable();
+    state.lastFedNavSequence = 0;
+    state.lastNavFeedValid = false;
+    SyncNavigatorRoiRequest(state);
     SetStatusWithOverlay(
         state,
         L"Navigator source disabled. Visual/manual tracking is unchanged.");
@@ -1595,6 +1680,7 @@ void OnStartTracking(ControlState& state)
         return;
     }
     FeedTrackingFromRoi(state);
+    FeedNavigatorFromRoi(state);
     SetStatusWithOverlay(
         state,
         L"Tracking Calibrating. ROI CPU buffers feed the worker; hide-on-Lost is armed.");
@@ -1678,7 +1764,7 @@ void StartCaptureNow(ControlState& state)
         return;
     }
     state.hideOverlayOnCaptureLoss = false;
-    SyncCanvasRoiRequest(state);
+    SyncCaptureRoiRequests(state);
     RefreshGeometryDisplay(
         state,
         L"WGC capture started (owned frames; preview off by default). Overlay test-pattern "
@@ -2460,9 +2546,10 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
                 return 0;
             }
             RefreshCalibrationValidity(*state);
-            SyncCanvasRoiRequest(*state);
+            SyncCaptureRoiRequests(*state);
             state->capture.PumpHandoff();
             FeedTrackingFromRoi(*state);
+            FeedNavigatorFromRoi(*state);
             tracing::capture::FramePacket const packet = state->capture.LastPacket();
             if (packet.stale)
             {

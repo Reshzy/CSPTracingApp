@@ -84,8 +84,21 @@ struct CanvasRoiRequest
     int captureH = 0;
 };
 
-// Owned packed BGRA copy of the latest completed canvas ROI. Copied out of
-// RoiReadback so the tracking worker can take it without racing the next map.
+// Capture-space Navigator thumbnail ROI. No full-content fallback: if this is
+// not applied, CaptureSession does not copy a Navigator CPU buffer.
+struct NavigatorRoiRequest
+{
+    bool applied = false;
+    bool mappingValidated = false;
+    int captureX = 0;
+    int captureY = 0;
+    int captureW = 0;
+    int captureH = 0;
+};
+
+// Owned packed BGRA copy of the latest completed canvas or Navigator ROI.
+// Copied out of RoiReadback so the UI/tracking threads can take it without
+// racing the next map.
 struct RoiCpuSnapshot
 {
     std::uint64_t sequence = 0;
@@ -165,12 +178,15 @@ public:
     void PumpHandoff();
     void NoteGeometryGeneration(std::uint64_t geometryGeneration) noexcept;
     void SetCanvasRoiRequest(CanvasRoiRequest const& request) noexcept;
+    void SetNavigatorRoiRequest(NavigatorRoiRequest const& request) noexcept;
 
     CaptureSessionState State() const noexcept;
     FramePacket LastPacket() const;
     bool HasOwnedFrame() const noexcept;
     bool HasRoiBuffer() const noexcept;
     RoiCpuSnapshot LastRoiBuffer() const;
+    bool HasNavigatorRoiBuffer() const noexcept;
+    RoiCpuSnapshot LastNavigatorRoiBuffer() const;
     // Borrowed; valid on the graphics/UI thread until Stop/OnItemClosed.
     ID3D11Texture2D* BorrowOwnedTexture() const noexcept;
     std::wstring FormatReport() const;
