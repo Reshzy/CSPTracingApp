@@ -712,6 +712,205 @@ TEST(TrackingSession, ReacquireEventsSeparateFromDrift)
     EXPECT_EQ(afterBlank.lastReject, VisualReject::BlankOrLowTexture);
 }
 
+std::int64_t NowMs(Clock::time_point now)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
+
+tracing::platform::InputObservation PredictedPan(
+    double dx,
+    double dy,
+    std::int64_t ticksMs,
+    std::uint64_t generation)
+{
+    tracing::platform::InputObservation observation{};
+    observation.source = tracing::platform::InputSource::Predicted;
+    observation.reject = tracing::platform::InputReject::Ok;
+    observation.ticksMs = ticksMs;
+    observation.targetGeneration = generation;
+    observation.hasTranslation = true;
+    observation.dx = dx;
+    observation.dy = dy;
+    observation.confidence = 0.25;
+    observation.pending = true;
+    observation.ageMs = 0;
+    return observation;
+}
+
+tracing::tracking::NavigatorObservation MissingNavigator()
+{
+    tracing::tracking::NavigatorObservation observation{};
+    observation.source = tracing::tracking::NavigatorSource::Missing;
+    observation.reject = tracing::tracking::NavigatorReject::BlankOrNoIndicator;
+    return observation;
+}
+
+tracing::platform::AccessibilitySnapshot UnsupportedUia(std::uint64_t generation)
+{
+    tracing::platform::AccessibilitySnapshot snapshot{};
+    snapshot.capability = tracing::platform::AccessibilityCapability::Unsupported;
+    snapshot.reject = tracing::platform::AccessibilityReject::Unsupported;
+    snapshot.enabled = false;
+    snapshot.targetGeneration = generation;
+    return snapshot;
+}
+
+TEST(TrackingSession, VisualOnlyIgnoresPredictedInput)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    TransformSnapshot const before = session.Snapshot();
+    std::optional<Vec2> const originBefore = Apply(before.mDs, Vec2{});
+    ASSERT_TRUE(originBefore.has_value());
+
+    EXPECT_EQ(session.GetFusionMode(), tracing::tracking::FusionMode::VisualOnly);
+    session.SetObserverSamples(
+        MissingNavigator(),
+        PredictedPan(10.0, 0.0, NowMs(t0), 1),
+        UnsupportedUia(1),
+        tracing::tracking::FusionMapping{});
+    session.Tick(t0);
+
+    TransformSnapshot const after = session.Snapshot();
+    std::optional<Vec2> const originAfter = Apply(after.mDs, Vec2{});
+    ASSERT_TRUE(originAfter.has_value());
+    EXPECT_NEAR(originAfter->x, originBefore->x, 1.0e-9);
+    EXPECT_NEAR(originAfter->y, originBefore->y, 1.0e-9);
+    EXPECT_FALSE(after.usedInput);
+    EXPECT_EQ(after.fusionMode, tracing::tracking::FusionMode::VisualOnly);
+}
+
+TEST(TrackingSession, HybridPredictedPanAcceptsEarly)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    TransformSnapshot const before = session.Snapshot();
+    std::optional<Vec2> const originBefore = Apply(before.mDs, Vec2{});
+    ASSERT_TRUE(originBefore.has_value());
+    EXPECT_EQ(before.sequence, 1u);
+
+    session.SetFusionMode(tracing::tracking::FusionMode::Hybrid);
+    session.SetObserverSamples(
+        MissingNavigator(),
+        PredictedPan(10.0, 0.0, NowMs(t0), 1),
+        UnsupportedUia(1),
+        tracing::tracking::FusionMapping{});
+    session.Tick(t0);
+
+    TransformSnapshot const after = session.Snapshot();
+    std::optional<Vec2> const originAfter = Apply(after.mDs, Vec2{});
+    ASSERT_TRUE(originAfter.has_value()) << session.FormatReport();
+    EXPECT_NEAR(originAfter->x - originBefore->x, 10.0, 1.0e-6);
+    EXPECT_NEAR(originAfter->y - originBefore->y, 0.0, 1.0e-6);
+    EXPECT_TRUE(after.usedInput);
+    EXPECT_FALSE(after.usedVisual);
+    EXPECT_EQ(after.sequence, 1u);
+    EXPECT_EQ(after.fusionMode, tracing::tracking::FusionMode::Hybrid);
+    EXPECT_EQ(after.fusionReject, tracing::tracking::FusionReject::Ok);
+}
+
+TEST(TrackingSession, HybridVisualCorrectsInputPrediction)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    TransformSnapshot const key = session.Snapshot();
+    std::optional<Vec2> const originKey = Apply(key.mDs, Vec2{});
+    ASSERT_TRUE(originKey.has_value());
+
+    session.SetFusionMode(tracing::tracking::FusionMode::Hybrid);
+    session.SetObserverSamples(
+        MissingNavigator(),
+        PredictedPan(10.0, 0.0, NowMs(t0), 1),
+        UnsupportedUia(1),
+        tracing::tracking::FusionMapping{});
+    session.Tick(t0);
+    TransformSnapshot const predicted = session.Snapshot();
+    std::optional<Vec2> const originPredicted = Apply(predicted.mDs, Vec2{});
+    ASSERT_TRUE(originPredicted.has_value());
+    EXPECT_NEAR(originPredicted->x - originKey->x, 10.0, 1.0e-6);
+
+    auto const applied =
+        session.SubmitEstimateForTest(Meta(2), OkEstimate(0.0, 0.0), false, {}, t0);
+    EXPECT_EQ(applied.action, TrackingApplyAction::Accepted);
+    TransformSnapshot const after = session.Snapshot();
+    std::optional<Vec2> const originAfter = Apply(after.mDs, Vec2{});
+    ASSERT_TRUE(originAfter.has_value()) << session.FormatReport();
+    EXPECT_NEAR(originAfter->x, originKey->x, 1.0e-6);
+    EXPECT_NEAR(originAfter->y, originKey->y, 1.0e-6);
+    EXPECT_TRUE(after.usedVisual);
+    EXPECT_FALSE(after.usedInput);
+    EXPECT_EQ(after.sequence, 2u);
+}
+
+TEST(TrackingSession, HybridNavigatorAndUiaDropoutKeepsVisualPose)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    auto const applied =
+        session.SubmitEstimateForTest(Meta(2), OkEstimate(4.0, 0.0), false, {}, t0);
+    EXPECT_EQ(applied.action, TrackingApplyAction::Accepted);
+    TransformSnapshot const visual = session.Snapshot();
+    std::optional<Vec2> const originVisual = Apply(visual.mDs, Vec2{});
+    ASSERT_TRUE(originVisual.has_value());
+    EXPECT_NEAR(originVisual->x - 100.0, 4.0, 1.0e-6);
+
+    session.SetFusionMode(tracing::tracking::FusionMode::Hybrid);
+    session.SetObserverSamples(
+        MissingNavigator(),
+        tracing::platform::InputObservation{},
+        UnsupportedUia(1),
+        tracing::tracking::FusionMapping{});
+    session.Tick(t0);
+
+    TransformSnapshot const after = session.Snapshot();
+    std::optional<Vec2> const originAfter = Apply(after.mDs, Vec2{});
+    ASSERT_TRUE(originAfter.has_value()) << session.FormatReport();
+    EXPECT_NEAR(originAfter->x, originVisual->x, 1.0e-6);
+    EXPECT_NEAR(originAfter->y, originVisual->y, 1.0e-6);
+    EXPECT_FALSE(after.usedNavigator);
+    EXPECT_FALSE(after.usedAccessibility);
+}
+
+TEST(TrackingSession, HybridWrongGenerationObserverDoesNotMoveSnapshot)
+{
+    TrackingSession session;
+    std::string error;
+    ASSERT_TRUE(BeginIdentity(session, error)) << error;
+    auto const t0 = Clock::now();
+    session.CaptureKeyframeForTest(Meta(1), t0);
+    TransformSnapshot const before = session.Snapshot();
+    std::optional<Vec2> const originBefore = Apply(before.mDs, Vec2{});
+    ASSERT_TRUE(originBefore.has_value());
+
+    session.SetFusionMode(tracing::tracking::FusionMode::Hybrid);
+    session.SetObserverSamples(
+        MissingNavigator(),
+        PredictedPan(10.0, 0.0, NowMs(t0), 99),
+        UnsupportedUia(99),
+        tracing::tracking::FusionMapping{});
+    session.Tick(t0);
+
+    TransformSnapshot const after = session.Snapshot();
+    std::optional<Vec2> const originAfter = Apply(after.mDs, Vec2{});
+    ASSERT_TRUE(originAfter.has_value()) << session.FormatReport();
+    EXPECT_NEAR(originAfter->x, originBefore->x, 1.0e-9);
+    EXPECT_NEAR(originAfter->y, originBefore->y, 1.0e-9);
+    EXPECT_FALSE(after.usedInput);
+    EXPECT_FALSE(after.usedAccessibility);
+}
+
 TEST(TrackingSimilarity, IdentityRoundTripMatchesCalibrationMds)
 {
     Transform2D const mDs =

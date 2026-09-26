@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/Transform2D.h"
+#include "tracking/TransformFusion.h"
 #include "tracking/VisualTracker.h"
 
 #include <chrono>
@@ -104,6 +105,16 @@ struct TransformSnapshot
     double driftRmsPx = 0.0;
     int reacquireCount = 0;
     bool hasSecondaryAnchor = false;
+    FusionMode fusionMode = FusionMode::VisualOnly;
+    FusionReject fusionReject = FusionReject::NoUsableSample;
+    bool usedVisual = false;
+    bool usedNavigator = false;
+    bool usedInput = false;
+    bool usedAccessibility = false;
+    double visualWeight = 0.0;
+    double navigatorWeight = 0.0;
+    double inputWeight = 0.0;
+    double accessibilityWeight = 0.0;
 };
 
 struct TrackingHandoffResult
@@ -982,6 +993,13 @@ public:
     void MarkUnavailable();
     void NoteGeometryGeneration(std::uint64_t geometryGeneration);
     void SetViewportAnchorS(core::Vec2 viewportAnchorS);
+    void SetFusionMode(FusionMode mode);
+    FusionMode GetFusionMode() const;
+    void SetObserverSamples(
+        NavigatorObservation const& navigator,
+        platform::InputObservation const& input,
+        platform::AccessibilitySnapshot const& accessibility,
+        FusionMapping const& mapping);
     void Stop();
 
     TrackingFrameAction SubmitRoiFrame(TrackingRoiFrame frame);
@@ -1014,6 +1032,11 @@ private:
     void ProcessCurrentFrame(TrackingRoiFrame const& current);
     TransformSnapshot BuildSnapshotLocked(std::chrono::steady_clock::time_point now) const;
     void PublishLocked(std::int64_t captureTicks, std::uint64_t sequence, VisualEstimate const& estimate);
+    void ResetFusionLocked() noexcept;
+    void FuseAndPublishLocked(
+        std::chrono::steady_clock::time_point now,
+        TrackingFrameMeta const* visualMeta,
+        VisualEstimate const* overlayVisual);
 
     TrackingSessionOptions options_{};
     mutable std::mutex mutex_;
@@ -1034,6 +1057,20 @@ private:
     TransformSnapshot snapshot_{};
     VisualEstimate lastEstimate_{};
     bool pausedForParity_ = false;
+    TransformFusion fusion_{};
+    FusionMode fusionMode_ = FusionMode::VisualOnly;
+    bool hasNavigatorSample_ = false;
+    NavigatorObservation navigatorSample_{};
+    bool hasInputSample_ = false;
+    platform::InputObservation inputSample_{};
+    bool hasAccessibilitySample_ = false;
+    platform::AccessibilitySnapshot accessibilitySample_{};
+    FusionMapping fusionMapping_{};
+    bool hasLastOverlayVisual_ = false;
+    FusionSample lastOverlayVisual_{};
+    bool hasFusedRelative_ = false;
+    core::Transform2D fusedRelative_ = core::Identity(core::Space::O, core::Space::O);
+    FusionResult lastFusion_{};
 };
 
 } // namespace tracing::tracking

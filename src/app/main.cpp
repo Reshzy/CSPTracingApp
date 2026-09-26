@@ -113,6 +113,7 @@ constexpr int kIdPredRot = 1060;
 constexpr int kIdApplyPredMapping = 1061;
 constexpr int kIdEnablePred = 1062;
 constexpr int kIdProbeUia = 1063;
+constexpr int kIdHybridFusion = 1064;
 constexpr UINT kMsgGeometry = WM_APP + 1;
 constexpr UINT kMsgCapture = WM_APP + 2;
 constexpr UINT kMsgStartCapture = WM_APP + 3;
@@ -188,6 +189,7 @@ struct ControlState
     HWND predPanEdit = nullptr;
     HWND predRotEdit = nullptr;
     HWND predEnableCheck = nullptr;
+    HWND hybridFusionCheck = nullptr;
     LiveCalibration calibration;
     bool hideOverlayOnCaptureLoss = false;
     bool obsSkipOverlayImagePresent = false;
@@ -603,7 +605,7 @@ std::wstring StatusHeader(ControlState const& state)
            L" rawInput=" +
            std::wstring(state.rawInputRegistered ? L"ok" : L"fail") +
            L" err=" + std::to_wstring(state.rawInputError) +
-           L" (mouse HID observe only; no NOLEGACY; unfused)\r\n" +
+           L" (mouse HID observe only; no NOLEGACY; fused only if Hybrid on)\r\n" +
            WidenAscii(tracing::platform::FormatAccessibilityReport(state.accessibility.Last())) +
            L" uiaEnabled=" +
            std::wstring(state.accessibility.Enabled() ? L"yes" : L"no") +
@@ -611,7 +613,7 @@ std::wstring StatusHeader(ControlState const& state)
            std::wstring(state.accessibility.SessionAttached() ? L"yes" : L"no") +
            L" uiaProbing=" +
            std::wstring(state.accessibility.Probing() ? L"yes" : L"no") +
-           L" (read-only probe; not fused; not tracking)\r\n";
+           L" (read-only probe; unsupported dropout; not a required fusion source)\r\n";
 }
 
 void SetStatus(ControlState& state, std::wstring const& text)
@@ -851,6 +853,25 @@ void SetStatusWithOverlay(ControlState& state, std::wstring const& body)
     SetStatus(state, StatusHeader(state) + body);
 }
 
+void FeedFusionObservers(ControlState& state)
+{
+    tracing::tracking::FusionMapping mapping{};
+    tracing::tracking::NavigatorMapping const navMap = state.navigator.Mapping();
+    if (navMap.applied)
+    {
+        mapping.documentWidth = navMap.documentWidth;
+        mapping.documentHeight = navMap.documentHeight;
+    }
+    tracing::tracking::TransformSnapshot const snap = state.tracking.Snapshot();
+    double const scale = std::hypot(snap.mDs.matrix.m[0], snap.mDs.matrix.m[1]);
+    mapping.overlayScale = scale > 1.0e-12 ? scale : 1.0;
+    state.tracking.SetObserverSamples(
+        state.navigator.Last(),
+        state.input.Last(),
+        state.accessibility.Last(),
+        mapping);
+}
+
 void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
 {
     if (!state.selected.has_value())
@@ -904,6 +925,7 @@ void RefreshGeometryDisplay(ControlState& state, std::wstring const& extra)
         state.tracking.NoteGeometryGeneration(sampled.geometryGeneration);
         state.tracking.SetViewportAnchorS(overlayOrigin);
     }
+    FeedFusionObservers(state);
     state.tracking.Tick(std::chrono::steady_clock::now());
     std::wstring body = tracing::platform::FormatGeometryReport(sampled);
     if (!extra.empty())
@@ -1683,8 +1705,11 @@ void FeedInputVisualCorrection(ControlState& state)
 
 void TickInputPrediction(ControlState& state)
 {
-    state.input.Tick(std::chrono::steady_clock::now());
+    auto const now = std::chrono::steady_clock::now();
+    state.input.Tick(now);
     FeedInputVisualCorrection(state);
+    FeedFusionObservers(state);
+    state.tracking.Tick(now);
 }
 
 bool RegisterMouseRawInput(HWND hwnd, unsigned long& error)
@@ -1809,7 +1834,8 @@ void OnApplyPredMapping(ControlState& state)
     SetStatusWithOverlay(
         state,
         L"Declared gesture mapping applied (wheel=zoom, Shift+wheel=rotate, middle-drag=pan). "
-        L"Prediction stays off until Enable pred. Input is not fused into overlay this step.");
+        L"Prediction stays off until Enable pred. Overlay uses prediction only when Hybrid fuse is on "
+        L"(default visual fallback).");
 }
 
 void OnEnablePred(ControlState& state)
@@ -1836,7 +1862,30 @@ void OnEnablePred(ControlState& state)
     SetStatusWithOverlay(
         state,
         L"Input prediction enabled for the selected foreground session only. "
-        L"Events are observed, not injected; CSP apply is not assumed; overlay is unfused.");
+        L"Events are observed, not injected; CSP apply is not assumed. Overlay uses prediction "
+        L"only when Hybrid fuse is on.");
+}
+
+void OnHybridFusion(ControlState& state)
+{
+    bool const checked = state.hybridFusionCheck != nullptr &&
+                         SendMessageW(state.hybridFusionCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    state.tracking.SetFusionMode(
+        checked ? tracing::tracking::FusionMode::Hybrid
+                : tracing::tracking::FusionMode::VisualOnly);
+    FeedFusionObservers(state);
+    state.tracking.Tick(std::chrono::steady_clock::now());
+    if (checked)
+    {
+        SetStatusWithOverlay(
+            state,
+            L"Hybrid fuse on. Navigator/Input contribute when usable; visual/manual fallback remains. "
+            L"Unsupported UIA is dropout.");
+        return;
+    }
+    SetStatusWithOverlay(
+        state,
+        L"Hybrid fuse off (default). Overlay follows visual/manual fallback; observers stay status-only.");
 }
 
 void OnProbeUia(ControlState& state)
@@ -1846,7 +1895,7 @@ void OnProbeUia(ControlState& state)
         SetStatusWithOverlay(
             state,
             L"Probe UIA: no session. Select a target first. Adapter stays disabled; "
-            L"unsupported is valid. Not fused into tracking.");
+            L"unsupported is valid. Optional fusion dropout only.");
         return;
     }
     if (state.accessibility.Probing())
@@ -2737,27 +2786,28 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
             392,
             516,
-            110,
+            100,
             24,
             hwnd,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdEnablePred)),
             instance,
             nullptr);
         SendMessageW(created->predEnableCheck, BM_SETCHECK, BST_UNCHECKED, 0);
-        addButton(L"Probe UIA", 508, 516, 90, 24, kIdProbeUia);
-        CreateWindowExW(
+        created->hybridFusionCheck = CreateWindowExW(
             0,
-            L"STATIC",
-            L"off until mapping; UIA optional",
-            WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOPREFIX,
-            602,
+            L"BUTTON",
+            L"Hybrid fuse",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            496,
             516,
-            90,
+            102,
             24,
             hwnd,
-            nullptr,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdHybridFusion)),
             instance,
             nullptr);
+        SendMessageW(created->hybridFusionCheck, BM_SETCHECK, BST_UNCHECKED, 0);
+        addButton(L"Probe UIA", 602, 516, 86, 24, kIdProbeUia);
         std::wstring deviceError;
         if (!created->device.Create(deviceError))
         {
@@ -2928,6 +2978,11 @@ LRESULT CALLBACK ControlWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             if (id == kIdEnablePred && code == BN_CLICKED)
             {
                 OnEnablePred(*state);
+                return 0;
+            }
+            if (id == kIdHybridFusion && code == BN_CLICKED)
+            {
+                OnHybridFusion(*state);
                 return 0;
             }
             if (id == kIdProbeUia && code == BN_CLICKED)

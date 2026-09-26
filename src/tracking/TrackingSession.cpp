@@ -1,5 +1,4 @@
 #include "tracking/TrackingSession.h"
-#include "tracking/TransformFusion.h"
 
 #include <cstdio>
 #include <utility>
@@ -29,41 +28,72 @@ CanvasView ViewFromFrame(TrackingRoiFrame const& frame) noexcept
     return view;
 }
 
-VisualEstimate FuseVisualOnlyIdentity(
-    VisualEstimate pose,
-    TrackingFrameMeta const& meta)
+std::int64_t NowMs(std::chrono::steady_clock::time_point now) noexcept
 {
-    if (pose.reject != VisualReject::Ok)
-    {
-        return pose;
-    }
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+}
 
-    TransformFusion fusion;
-    FusionContext context{};
-    context.targetGeneration = meta.targetGeneration;
-    context.geometryGeneration = meta.geometryGeneration;
-    context.calibrationGeneration = meta.calibrationGeneration;
-    context.nowMs = 0;
+VisualEstimate OverlaySpaceEstimate(VisualEstimate estimate, int downsample) noexcept
+{
+    int const ds = downsample < 1 ? 1 : downsample;
+    estimate.tx *= static_cast<double>(ds);
+    estimate.ty *= static_cast<double>(ds);
+    return estimate;
+}
 
-    FusionSample visual = FromVisual(pose);
-    visual.targetGeneration = meta.targetGeneration;
-    visual.geometryGeneration = meta.geometryGeneration;
-    visual.calibrationGeneration = meta.calibrationGeneration;
-    visual.timestampMs = 0;
+VisualEstimate IdentityOverlayEstimate() noexcept
+{
+    VisualEstimate estimate{};
+    estimate.reject = VisualReject::Ok;
+    estimate.uniformScale = 1.0;
+    estimate.confidence = 1.0;
+    estimate.inlierCount = 0;
+    estimate.parity = VisualParity::None;
+    return estimate;
+}
 
-    FusionInputs inputs{};
-    inputs.hasVisual = true;
-    inputs.visual = visual;
-    FusionResult const fused = fusion.Fuse(context, inputs);
-    if (!fused.accepted)
-    {
-        return pose;
-    }
+VisualEstimate EstimateFromFusion(FusionResult const& fused, VisualEstimate const& quality) noexcept
+{
+    VisualEstimate estimate = quality;
+    estimate.reject = VisualReject::Ok;
+    estimate.tx = fused.tx;
+    estimate.ty = fused.ty;
+    estimate.uniformScale = fused.uniformScale;
+    estimate.radiansClockwise = fused.radiansClockwise;
+    estimate.flipX = fused.flipX;
+    estimate.flipY = fused.flipY;
+    estimate.parity = VisualParityFromFlags(fused.flipX, fused.flipY);
+    estimate.confidence = fused.confidence;
+    return estimate;
+}
+
+core::Transform2D RelativeFromFusion(FusionResult const& fused)
+{
+    VisualEstimate pose{};
+    pose.reject = VisualReject::Ok;
     pose.tx = fused.tx;
     pose.ty = fused.ty;
     pose.uniformScale = fused.uniformScale;
     pose.radiansClockwise = fused.radiansClockwise;
-    return pose;
+    pose.flipX = fused.flipX;
+    pose.flipY = fused.flipY;
+    return SimilarityFromEstimate(pose, 1);
+}
+
+void StampSampleGenerations(FusionSample& sample, FusionContext const& context) noexcept
+{
+    if (sample.targetGeneration == 0)
+    {
+        sample.targetGeneration = context.targetGeneration;
+    }
+    if (sample.geometryGeneration == 0)
+    {
+        sample.geometryGeneration = context.geometryGeneration;
+    }
+    if (sample.calibrationGeneration == 0)
+    {
+        sample.calibrationGeneration = context.calibrationGeneration;
+    }
 }
 
 } // namespace
@@ -158,6 +188,27 @@ std::string FormatTrackingSnapshot(TransformSnapshot const& snapshot)
     text += snapshot.hasSecondaryAnchor ? "yes" : "no";
     text += " parity=";
     text += VisualParityName(VisualParityFromFlags(snapshot.flipX, snapshot.flipY));
+    text += " fusion=";
+    text += FormatFusionMode(snapshot.fusionMode);
+    text += " fuseReject=";
+    text += FormatFusionReject(snapshot.fusionReject);
+    text += " src=";
+    text += snapshot.usedVisual ? "V" : "-";
+    text += snapshot.usedNavigator ? "N" : "-";
+    text += snapshot.usedInput ? "I" : "-";
+    text += snapshot.usedAccessibility ? "U" : "-";
+    text += " wV=";
+    std::snprintf(number, sizeof(number), "%.3f", snapshot.visualWeight);
+    text += number;
+    text += " wN=";
+    std::snprintf(number, sizeof(number), "%.3f", snapshot.navigatorWeight);
+    text += number;
+    text += " wI=";
+    std::snprintf(number, sizeof(number), "%.3f", snapshot.inputWeight);
+    text += number;
+    text += " wU=";
+    std::snprintf(number, sizeof(number), "%.3f", snapshot.accessibilityWeight);
+    text += number;
     text += " gens=";
     text += std::to_string(snapshot.targetGeneration);
     text += "/";
@@ -218,6 +269,7 @@ bool TrackingSession::BeginCalibrated(
         pendingCount_ = 0;
         lastEstimate_ = {};
         pausedForParity_ = false;
+        ResetFusionLocked();
         snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
         stop_ = false;
         EnsureWorkerLocked();
@@ -257,6 +309,7 @@ void TrackingSession::Resync()
     pendingCount_ = 0;
     lastEstimate_ = {};
     pausedForParity_ = false;
+    ResetFusionLocked();
     snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
 }
 
@@ -274,6 +327,7 @@ void TrackingSession::Detach()
     pendingCount_ = 0;
     lastEstimate_ = {};
     pausedForParity_ = false;
+    ResetFusionLocked();
     snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
 }
 
@@ -301,6 +355,35 @@ void TrackingSession::SetViewportAnchorS(core::Vec2 viewportAnchorS)
     snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
 }
 
+void TrackingSession::SetFusionMode(FusionMode mode)
+{
+    std::lock_guard<std::mutex> const lock(mutex_);
+    fusionMode_ = mode;
+    snapshot_.fusionMode = mode;
+}
+
+FusionMode TrackingSession::GetFusionMode() const
+{
+    std::lock_guard<std::mutex> const lock(mutex_);
+    return fusionMode_;
+}
+
+void TrackingSession::SetObserverSamples(
+    NavigatorObservation const& navigator,
+    platform::InputObservation const& input,
+    platform::AccessibilitySnapshot const& accessibility,
+    FusionMapping const& mapping)
+{
+    std::lock_guard<std::mutex> const lock(mutex_);
+    hasNavigatorSample_ = true;
+    navigatorSample_ = navigator;
+    hasInputSample_ = true;
+    inputSample_ = input;
+    hasAccessibilitySample_ = true;
+    accessibilitySample_ = accessibility;
+    fusionMapping_ = mapping;
+}
+
 void TrackingSession::Stop()
 {
     {
@@ -310,6 +393,7 @@ void TrackingSession::Stop()
         pending_[0] = {};
         pending_[1] = {};
         pendingCount_ = 0;
+        ResetFusionLocked();
         snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
         cv_.notify_all();
     }
@@ -380,23 +464,16 @@ TrackingApplyResult TrackingSession::SubmitEstimateForTest(
         secondaryEstimate);
     if (applied.accepted)
     {
-        PublishLocked(
-            meta.captureTicks,
-            meta.sequence,
-            FuseVisualOnlyIdentity(applied.poseEstimate, meta));
-    }
-    snapshot_ = BuildSnapshotLocked(now);
-    snapshot_.lastReject = policy_.LastReject();
-    if (applied.accepted)
-    {
-        snapshot_.confidence = applied.poseEstimate.confidence;
+        VisualEstimate const overlay = OverlaySpaceEstimate(applied.poseEstimate, meta.downsample);
+        FuseAndPublishLocked(now, &meta, &overlay);
         snapshot_.inlierCount = applied.poseEstimate.inlierCount;
         snapshot_.rmsResidualPx = applied.poseEstimate.rmsResidualPx;
-        snapshot_.sequence = meta.sequence;
-        snapshot_.captureTicks = meta.captureTicks;
         snapshot_.lastReject = applied.poseEstimate.reject;
-        snapshot_.flipX = applied.poseEstimate.flipX;
-        snapshot_.flipY = applied.poseEstimate.flipY;
+    }
+    else
+    {
+        snapshot_ = BuildSnapshotLocked(now);
+        snapshot_.lastReject = policy_.LastReject();
     }
     if (policy_.State() == TrackingState::Paused &&
         keyframeEstimate.reject == VisualReject::ParityAmbiguous)
@@ -425,14 +502,9 @@ void TrackingSession::CaptureKeyframeForTest(
     hasPreviousFrame_ = false;
     hasSecondaryFrame_ = false;
     pausedForParity_ = false;
-    lastEstimate_.reject = VisualReject::Ok;
-    lastEstimate_.uniformScale = 1.0;
-    lastEstimate_.confidence = 1.0;
-    lastEstimate_.flipX = false;
-    lastEstimate_.flipY = false;
-    lastEstimate_.parity = VisualParity::None;
-    PublishLocked(meta.captureTicks, meta.sequence, lastEstimate_);
-    snapshot_ = BuildSnapshotLocked(now);
+    lastEstimate_ = IdentityOverlayEstimate();
+    VisualEstimate const overlay = lastEstimate_;
+    FuseAndPublishLocked(now, &meta, &overlay);
 }
 
 void TrackingSession::PromoteSecondaryAnchorForTest()
@@ -450,6 +522,11 @@ void TrackingSession::Tick(std::chrono::steady_clock::time_point now)
     if (policy_.Pending() == 0)
     {
         policy_.Tick(now, options_);
+    }
+    if (fusionMode_ == FusionMode::Hybrid && policy_.HasKeyframe())
+    {
+        FuseAndPublishLocked(now, nullptr, nullptr);
+        return;
     }
     snapshot_ = BuildSnapshotLocked(now);
 }
@@ -514,14 +591,11 @@ void TrackingSession::ProcessCurrentFrame(TrackingRoiFrame const& current)
             hasPreviousFrame_ = false;
             hasSecondaryFrame_ = false;
             pausedForParity_ = false;
-            policy_.NoteKeyframeCaptured(std::chrono::steady_clock::now(), current.meta.sequence);
-            lastEstimate_.reject = VisualReject::Ok;
-            lastEstimate_.uniformScale = 1.0;
-            lastEstimate_.confidence = 1.0;
-            lastEstimate_.flipX = false;
-            lastEstimate_.flipY = false;
-            lastEstimate_.parity = VisualParity::None;
-            PublishLocked(current.meta.captureTicks, current.meta.sequence, lastEstimate_);
+            auto const now = std::chrono::steady_clock::now();
+            policy_.NoteKeyframeCaptured(now, current.meta.sequence);
+            lastEstimate_ = IdentityOverlayEstimate();
+            VisualEstimate const overlay = lastEstimate_;
+            FuseAndPublishLocked(now, &current.meta, &overlay);
             return;
         }
         keyframeCopy = keyframe_;
@@ -568,10 +642,12 @@ void TrackingSession::ProcessCurrentFrame(TrackingRoiFrame const& current)
             secondaryEstimate);
         if (applied.accepted)
         {
-            PublishLocked(
-                current.meta.captureTicks,
-                current.meta.sequence,
-                FuseVisualOnlyIdentity(applied.poseEstimate, current.meta));
+            VisualEstimate const overlay =
+                OverlaySpaceEstimate(applied.poseEstimate, current.meta.downsample);
+            FuseAndPublishLocked(now, &current.meta, &overlay);
+            snapshot_.inlierCount = applied.poseEstimate.inlierCount;
+            snapshot_.rmsResidualPx = applied.poseEstimate.rmsResidualPx;
+            snapshot_.lastReject = applied.poseEstimate.reject;
             if (policy_.State() == TrackingState::Tracking &&
                 SecondaryPromotionQualityOk(applied.poseEstimate) &&
                 !OverlayRelativeNearIdentity(policy_.LastRelative()))
@@ -618,8 +694,19 @@ TransformSnapshot TrackingSession::BuildSnapshotLocked(
     snapshot.driftRmsPx = policy_.OriginDriftRmsPx();
     snapshot.reacquireCount = policy_.ReacquireEvents();
     snapshot.hasSecondaryAnchor = policy_.HasSecondaryAnchor();
+    snapshot.fusionMode = fusionMode_;
+    snapshot.fusionReject = lastFusion_.reject;
+    snapshot.usedVisual = lastFusion_.usedVisual;
+    snapshot.usedNavigator = lastFusion_.usedNavigator;
+    snapshot.usedInput = lastFusion_.usedInput;
+    snapshot.usedAccessibility = lastFusion_.usedAccessibility;
+    snapshot.visualWeight = lastFusion_.visualWeight;
+    snapshot.navigatorWeight = lastFusion_.navigatorWeight;
+    snapshot.inputWeight = lastFusion_.inputWeight;
+    snapshot.accessibilityWeight = lastFusion_.accessibilityWeight;
 
-    core::Transform2D const relative = policy_.LastRelative();
+    core::Transform2D const relative =
+        hasFusedRelative_ ? fusedRelative_ : policy_.LastRelative();
     std::optional<core::Transform2D> const mDo = core::Compose(mDoKeyframe_, relative);
     if (mDo.has_value())
     {
@@ -646,6 +733,119 @@ void TrackingSession::PublishLocked(
     snapshot_.rmsResidualPx = estimate.rmsResidualPx;
     snapshot_.lastReject = estimate.reject;
     snapshot_ = BuildSnapshotLocked(std::chrono::steady_clock::now());
+}
+
+void TrackingSession::ResetFusionLocked() noexcept
+{
+    fusion_.Reset();
+    hasLastOverlayVisual_ = false;
+    lastOverlayVisual_ = {};
+    hasFusedRelative_ = false;
+    fusedRelative_ = core::Identity(core::Space::O, core::Space::O);
+    lastFusion_ = {};
+    lastFusion_.mode = fusionMode_;
+}
+
+void TrackingSession::FuseAndPublishLocked(
+    std::chrono::steady_clock::time_point now,
+    TrackingFrameMeta const* visualMeta,
+    VisualEstimate const* overlayVisual)
+{
+    FusionContext context{};
+    context.targetGeneration = policy_.TargetGeneration();
+    context.geometryGeneration = policy_.GeometryGeneration();
+    context.calibrationGeneration = policy_.CalibrationGeneration();
+    context.nowMs = NowMs(now);
+
+    FusionInputs inputs{};
+    if (overlayVisual != nullptr && overlayVisual->reject == VisualReject::Ok && visualMeta != nullptr)
+    {
+        FusionSample visual = FromVisual(*overlayVisual);
+        visual.targetGeneration = visualMeta->targetGeneration;
+        visual.geometryGeneration = visualMeta->geometryGeneration;
+        visual.calibrationGeneration = visualMeta->calibrationGeneration;
+        visual.timestampMs = context.nowMs;
+        inputs.hasVisual = true;
+        inputs.visual = visual;
+        lastOverlayVisual_ = visual;
+        hasLastOverlayVisual_ = true;
+    }
+
+    if (fusionMode_ == FusionMode::Hybrid)
+    {
+        FusionPose const lastPose = fusion_.LastPose();
+        FusionPose const* posePtr = fusion_.HasAcceptedPose() ? &lastPose : nullptr;
+
+        FusionSample navigator = FromNavigator(navigatorSample_, fusionMapping_);
+        StampSampleGenerations(navigator, context);
+        if (navigator.timestampMs == 0)
+        {
+            navigator.timestampMs = context.nowMs;
+        }
+        inputs.hasNavigator = hasNavigatorSample_;
+        inputs.navigator = navigator;
+
+        FusionSample input = FromInput(inputSample_, posePtr);
+        StampSampleGenerations(input, context);
+        inputs.hasInput = hasInputSample_;
+        inputs.input = input;
+
+        FusionSample accessibility = FromAccessibility(accessibilitySample_, posePtr);
+        StampSampleGenerations(accessibility, context);
+        if (accessibility.timestampMs == 0)
+        {
+            accessibility.timestampMs = context.nowMs;
+        }
+        inputs.hasAccessibility = hasAccessibilitySample_;
+        inputs.accessibility = accessibility;
+    }
+
+    FusionResult const fused = fusion_.Fuse(context, inputs);
+    if (fused.accepted || visualMeta != nullptr)
+    {
+        lastFusion_ = fused;
+    }
+
+    if (fused.accepted)
+    {
+        bool const observerContributed =
+            fused.usedNavigator || fused.usedInput || fused.usedAccessibility;
+        VisualEstimate quality = overlayVisual != nullptr ? *overlayVisual : lastEstimate_;
+        if (observerContributed)
+        {
+            VisualEstimate const published = EstimateFromFusion(fused, quality);
+            fusedRelative_ = RelativeFromFusion(fused);
+            hasFusedRelative_ = true;
+            if (visualMeta != nullptr)
+            {
+                PublishLocked(visualMeta->captureTicks, visualMeta->sequence, published);
+            }
+            else
+            {
+                lastEstimate_ = published;
+                snapshot_.confidence = published.confidence;
+                snapshot_ = BuildSnapshotLocked(now);
+            }
+            return;
+        }
+
+        if (visualMeta != nullptr)
+        {
+            fusedRelative_ = policy_.LastRelative();
+            hasFusedRelative_ = true;
+            VisualEstimate published = quality;
+            published.reject = VisualReject::Ok;
+            if (overlayVisual != nullptr)
+            {
+                published = *overlayVisual;
+                published.reject = VisualReject::Ok;
+            }
+            PublishLocked(visualMeta->captureTicks, visualMeta->sequence, published);
+            return;
+        }
+    }
+
+    snapshot_ = BuildSnapshotLocked(now);
 }
 
 } // namespace tracing::tracking
