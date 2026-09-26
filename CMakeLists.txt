@@ -267,6 +267,22 @@ add_executable(TracingApp.MetricsTests
 tracing_app_apply_first_party_options(TracingApp.MetricsTests)
 target_link_libraries(TracingApp.MetricsTests PRIVATE GTest::gtest_main)
 
+add_executable(TracingApp.TrackingReplayTests
+    tests/replay/TrackingReplayTests.cpp
+    tests/replay/SequenceGenerator.cpp
+    src/tracking/TrackingSession.cpp
+    src/tracking/TransformFusion.cpp
+    src/tracking/VisualTracker.cpp
+    src/core/Transform2D.cpp)
+tracing_app_apply_first_party_options(TracingApp.TrackingReplayTests)
+target_include_directories(TracingApp.TrackingReplayTests PRIVATE "${CMAKE_SOURCE_DIR}/tests/replay")
+target_link_libraries(TracingApp.TrackingReplayTests PRIVATE
+    GTest::gtest_main
+    opencv_core
+    opencv_imgproc
+    opencv_features2d
+    opencv_calib3d)
+
 add_executable(TracingApp.InputProbe WIN32
     tests/harness/InputProbe.cpp
     resources/app.manifest)
@@ -289,4 +305,5 @@ add_test(NAME TracingApp.InputPredictionTests COMMAND TracingApp.InputPrediction
 add_test(NAME TracingApp.ObserverCapabilityTests COMMAND TracingApp.ObserverCapabilityTests)
 add_test(NAME TracingApp.FusionTests COMMAND TracingApp.FusionTests)
 add_test(NAME TracingApp.MetricsTests COMMAND TracingApp.MetricsTests)
+add_test(NAME TracingApp.TrackingReplayTests COMMAND TracingApp.TrackingReplayTests)
 add_test(NAME TracingApp.InputProbe COMMAND TracingApp.InputProbe --self-test)
